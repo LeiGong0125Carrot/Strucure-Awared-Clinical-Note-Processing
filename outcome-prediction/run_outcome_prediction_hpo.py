@@ -16,12 +16,12 @@ from transformers import AdamW, BertConfig, BertTokenizer, BertForSequenceClassi
         AutoTokenizer, AutoConfig, AutoModel, BertTokenizerFast, set_seed, get_linear_schedule_with_warmup
 from transformers.models.longformer.modeling_longformer import LongformerSelfAttention
 from outcome_models import BertLongForSequenceClassification, LitAugPredictorBienc, LitAugPredictorCrossenc, L2RLitAugPredictorBienc
-
+import ray
 from ray import tune
 from ray.tune.schedulers import MedianStoppingRule
 from shutil import copyfile
 
-os.environ["TUNE_DISABLE_STRICT_METRIC_CHECKING"] = "1"
+# os.environ["TUNE_DISABLE_STRICT_METRIC_CHECKING"] = "1"
 
 def create_long_model(init_model, save_model_to, attention_window, max_pos, num_labels):
     config = BertConfig.from_pretrained(init_model, 
@@ -235,8 +235,8 @@ if __name__ == '__main__':
     parser.add_argument('--dev', type=str, action='store', required=True, help='Path to development file')
     parser.add_argument('--test', type=str, action='store', required=True, help='Path to test file')
     parser.add_argument('--lit_dir', type=str, action='store', help='Path to directory containing literature ')
-    parser.add_argument('--init_model', type=str, action='store', default='microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext', \
-            help='Pretrained model to initialize weights from')
+    parser.add_argument('--init_model', type=str, action='store', default='microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext', \
+            help='Pretrained model to initialize weights from') 
     parser.add_argument('--rerank_model', type=str, action='store', help='Pretrained model to initialize reranker weights from')
     parser.add_argument('--rerank_checkpoint', type=str, action='store', help='Checkpoint to load reranker weights from')
     parser.add_argument('--longmodel_dir', type=str, action='store', help='Path to dump longformer version of model')
@@ -275,6 +275,7 @@ if __name__ == '__main__':
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
+    ray.init(address='auto')
     set_seed(args.seed)
     setproctitle.setproctitle("python")
     '''
@@ -492,7 +493,7 @@ if __name__ == '__main__':
         config={
             "num_workers": 3, 
             "lr": tune.grid_search([5e-4, 1e-5, 5e-5, 1e-6, 5e-6]),
-            "k": tune.grid_search([1, 5, 10]),
+            "k": tune.grid_search([1]),
             "acc": tune.grid_search([10, 20])
         },
         resources_per_trial={'gpu': 1},
