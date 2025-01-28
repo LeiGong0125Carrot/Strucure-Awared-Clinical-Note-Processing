@@ -7,6 +7,9 @@ import torch.nn as nn
 from dataclasses import dataclass, field
 from transformers import BertForSequenceClassification
 from transformers.models.longformer.modeling_longformer import LongformerSelfAttention
+import torch.nn.functional as F
+import contrastive_utils
+from contrastive_utils import construct_pairs, check_pairs_labels
 
 section_names = [
             'discharge diagnosis', 'major surgical or invasive procedure', 'history of present illness',
@@ -90,10 +93,11 @@ class BertLongSelfAttention(LongformerSelfAttention):
                 is_index_masked=is_index_masked) # output_attentions=output_attentions [Arg not present in v4.1.1]
 
 class ContextAwareContrastiveEmbeddingGenerator(nn.Module):
-    def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8):
+    def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, la_alpha=0.3):
         super().__init__()
         self.bert = model
         # self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        self.la_alpha = la_alpha
         self.config = config
         self.input_size = self.config.hidden_size
         self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
@@ -112,6 +116,7 @@ class ContextAwareContrastiveEmbeddingGenerator(nn.Module):
         nn.init.xavier_uniform_(self.missing_embeddings.weight)
         nn.init.xavier_uniform_(self.position_embeddings.weight)
         nn.init.xavier_uniform_(self.section_weights.weight)
+    
         
     def contrastive_forward(self, anchor_enc, positives_enc, negatives_enc):
         anchor_emb = self.bert.bert(
@@ -158,7 +163,8 @@ class ContextAwareContrastiveEmbeddingGenerator(nn.Module):
 
         return anchor_emb, pos_emb, neg_emb
 
-    def forward(self, batch):
+
+    def forward(self, batch, do_contrastive_loss=False, top_k=3):
         device = self.missing_embeddings.weight.device
         # print(batch.keys())
         batch_size = len(batch['ehr_id'])
@@ -276,18 +282,224 @@ class ContextAwareContrastiveEmbeddingGenerator(nn.Module):
         
         section_embeddings = section_embeddings.to(device)
         document_embeddings = torch.mean(section_embeddings, dim=1)
+
+
         logits = self.predictor(document_embeddings)
+        if do_contrastive_loss == True:
+            anchors, positive_samples, negative_samples = construct_samples(
+                document_embeddings, batch['labels'], top_k=top_k
+            )
+            
+            return ((anchors, positive_samples, negative_samples), logits)
+
         # logits = logits.to(device)
+        return (None, logits)
+    
+    def _build_adjacency_matrix(self, section_embeddings, threshold=0.5, k=None):
+        """
+        动态生成邻接矩阵，使用固定阈值或 top-k 稀疏化
+        :param section_embeddings: [batch_size, num_sections, embedding_dim]
+        :param threshold: 相似度阈值
+        :param k: top-k 相似邻居（可选）
+        :return: 邻接矩阵 A [batch_size, num_sections, num_sections]
+        """
+        normalized_embeddings = F.normalize(section_embeddings, dim=-1)  # 归一化
+        similarity_matrix = torch.einsum('bnd,bmd->bnm', normalized_embeddings, normalized_embeddings)
+
+        # 使用 threshold 稀疏化
+        if k is None:
+            return (similarity_matrix >= threshold).float() * similarity_matrix
+
+        # 使用 top-k 稀疏化
+        topk_values, _ = torch.topk(similarity_matrix, k=k, dim=-1)
+        dynamic_threshold = topk_values[:, :, -1].unsqueeze(-1)  # 每行的第 k 大值作为动态阈值
+        return (similarity_matrix >= dynamic_threshold).float() * similarity_matrix
+
+    def _laplacian_smoothing(self, section_embeddings, adjacency_matrix):
+        """
+        对嵌入应用图拉普拉斯平滑（向量化版本）
+        :param section_embeddings: [batch_size, num_sections, embedding_dim]
+        :param adjacency_matrix: [batch_size, num_sections, num_sections]
+        :return: 平滑后的 section_embeddings
+        """
+        batch_size, num_sections, embedding_dim = section_embeddings.shape
+
+        # Step 1: 计算度矩阵 D
+        degree_matrix = adjacency_matrix.sum(dim=-1)  # [batch_size, num_sections]
+        degree_matrix_inv = torch.diag_embed(1.0 / degree_matrix)  # [batch_size, num_sections, num_sections]
+
+        # Step 2: 计算拉普拉斯矩阵 L
+        laplacian_matrix = torch.eye(num_sections, device=adjacency_matrix.device).unsqueeze(0) \
+                        - torch.matmul(degree_matrix_inv, adjacency_matrix)  # [batch_size, num_sections, num_sections]
+
+        # Step 3: 应用拉普拉斯平滑
+        identity_matrix = torch.eye(num_sections, device=adjacency_matrix.device).unsqueeze(0)  # [1, num_sections, num_sections]
+        smoothing_matrix = identity_matrix - self.alpha * laplacian_matrix  # [batch_size, num_sections, num_sections]
+
+        smoothed_embeddings = torch.matmul(smoothing_matrix, section_embeddings)  # [batch_size, num_sections, embedding_dim]
+        return smoothed_embeddings
+    
+    def _weighted_document_embedding(self, section_embeddings):
+        context_vector = torch.mean(section_embeddings, dim=1, keepdim=True)  # 全局上下文
+        attention_scores = torch.bmm(section_embeddings, context_vector.transpose(1, 2)).squeeze(-1)  # [batch_size, num_sections]
+        attention_weights = F.softmax(attention_scores, dim=-1)  # [batch_size, num_sections]
+        weighted_embedding = torch.sum(attention_weights.unsqueeze(-1) * section_embeddings, dim=1)  # 加权平均
+        return weighted_embedding
+    
+    def laplacian_forward(self, batch, do_contrastive_loss, top_k=3):
+        device = self.missing_embeddings.weight.device
+        # print(batch.keys())
+        batch_size = len(batch['ehr_id'])
+        num_sections = len(batch['sections'].keys())
+        section_names = list(batch['sections'].keys())
+        batch['labels'] = batch['labels'].to(device)
+        section_embeddings = torch.zeros((batch_size, num_sections, self.missing_embeddings.embedding_dim), device=device)
+        # print(f"Section Embedding shape: {section_embeddings.shape}")
+        existing_vectors = torch.zeros((batch_size, num_sections), dtype=torch.float, device=device)
+        # print(f"Existing_vectors shape: {existing_vectors.shape}")
+
+        for idx, section_name in enumerate(section_names):
+            section_data = batch['sections'][section_name]
+            #print(section_data.keys())
+            input_ids = section_data['input_ids']
+            attention_mask = section_data['attention_mask']
+            token_type_ids = section_data['token_type_ids']
+            
+            has_section = attention_mask.sum(dim=1) > 0
+            # print(f"has_section: {has_section}")
+
+            if has_section.any():
+                # print(f"Present Indices: {present_indices}")
+                present_indices = torch.where(has_section)[0].to(device)
+                # print(f"Present Indices: {present_indices}")
+                present_input_ids = input_ids[present_indices].to(device)
+                present_attention_mask = attention_mask[present_indices].to(device)
+                present_token_type_ids = token_type_ids[present_indices].to(device)
+
+                outputs = self.bert.bert(
+                    input_ids=present_input_ids, 
+                    attention_mask=present_attention_mask,
+                    token_type_ids=present_token_type_ids,
+                    position_ids=None,
+                    head_mask=None,
+                    inputs_embeds=None,
+                    output_attentions=None,
+                    output_hidden_states=None,
+                    return_dict=None
+                )
+                # 多线程处理来提速
+                cls_embeddings = outputs.last_hidden_state[:, 0, :]
+                cls_embeddings = cls_embeddings.to(device)
+                
+                for idx_in_present, ehr_idx in enumerate(present_indices):
+                    # print(f"idx in present: {idx_in_present}")
+                    # print(f"ehr_idx: {ehr_idx}")
+                    section_embeddings[ehr_idx, idx, :] = cls_embeddings[idx_in_present]
+                    existing_vectors[ehr_idx, idx] = 1  # 更新 existing_vectors
+
+            missing_indices = torch.where(~has_section)[0].to(device)
+            # print(f"Missing Indices: {missing_indices}")
+            if len(missing_indices) > 0:
+                missing_embeddings = self.missing_embeddings(torch.tensor(idx).to(device))
+                section_embeddings[missing_indices, idx, :] = missing_embeddings 
+            # print("-" * 120)
+        # print(f"Section Embedding shape: {section_embeddings.shape}")
+        # exit(0)
+        # print(f"Existing_vectors: {existing_vectors}")
+        # print(f"Initial Section Embeddings: {section_embeddings}'")
+        # print(f"Initial Section Embeddings shape: {section_embeddings.shape}")
+
+        for ehr_idx in range(batch_size):
+            ehr_embeddings = section_embeddings[ehr_idx]
+            # print(f"EHR_Embeddings: {ehr_embeddings}")
+            # print(f"EHR_Embeddings shape: {ehr_embeddings.shape}")
+            ehr_existence_vector = existing_vectors[ehr_idx]
+            # print(f"EHR_existence_vector: {ehr_existence_vector}")
+            # print(f"EHR_existence_vector shape: {ehr_existence_vector.shape}")
+            exist_indices = ehr_existence_vector.bool()
+
+            if exist_indices.sum() == 0:
+                continue
+            # print(f"Exist_indices: {exist_indices}")
+            exist_section_embeddings = ehr_embeddings[exist_indices]
+            # print(f"Exist_section_embeddings: {exist_section_embeddings}")
+            
+            # print(f"Exist_section_embeddings shape: {exist_section_embeddings.shape}")
+            exist_section_embeddings = exist_section_embeddings.unsqueeze(1)  # [20, 1, 768]
+            # print(f"Adjusted exist_section_embeddings: {exist_section_embeddings.shape}")
+
+            missing_indices = torch.where(~exist_indices)[0]
+            updated_ehr_embeddings = []
+
+            for idx_in_ehr_embeddings, embedding in enumerate(ehr_embeddings):
+                if idx_in_ehr_embeddings in missing_indices:
+                    # Get the index within missing_indices
+                    idx_in_missing = (missing_indices == idx_in_ehr_embeddings).nonzero(as_tuple=True)[0].item()
+
+                    # Prepare missing_embedding
+                    missing_embedding = embedding.unsqueeze(0).unsqueeze(1)  # Shape: [1, 1, embedding_dim]
+
+                    # Compute attention output
+                    attn_output, _ = self.attention_layer(
+                        query=missing_embedding,
+                        key=exist_section_embeddings,
+                        value=exist_section_embeddings
+                    )
+
+                    # Update embedding (no in-place operation)
+                    updated_embedding = attn_output.squeeze(0).squeeze(0)
+                else:
+                    # Keep the original embedding
+                    updated_embedding = embedding
+
+                # Append to the list
+                updated_ehr_embeddings.append(updated_embedding)
+
+            # Stack the updated embeddings to form a tensor
+            ehr_embeddings = torch.stack(updated_ehr_embeddings, dim=0)  # Shape: [num_sections, embedding_dim]
+
+            # Assign back to section_embeddings without in-place modification
+            section_embeddings = section_embeddings.clone()
+            section_embeddings[ehr_idx] = ehr_embeddings
+        
+        section_embeddings = section_embeddings.to(device)
+        # document_embeddings = torch.mean(section_embeddings, dim=1)
+
+        # Step 2: 动态生成邻接矩阵
+        adjacency_matrix = self._build_adjacency_matrix(section_embeddings, k=5)
+        '''print(f"Raw Section Embeddings: {section_embeddings}")
+        print(f"Raw Section shape: {section_embeddings.shape}")
+        print(f"Adjacency matrix: {adjacency_matrix}")
+        # Step 3: 图拉普拉斯平滑（向量化版本）'''
+        section_embeddings = self._laplacian_smoothing(section_embeddings, adjacency_matrix)
+        '''print(f"Smoothed Section Embeddings: {section_embeddings}")
+        print(f"Smoothed Section Shape: {section_embeddings.shape}")
+        exit(0)'''
+        # Step 4: 生成最终文档嵌入并进行分类
+        # document_embeddings = torch.mean(section_embeddings, dim=1)  # 平均池化
+        document_embeddings = self._weighted_document_embedding(section_embeddings)
+        if do_contrastive_loss == True:
+            anchors, positive_samples, negative_samples = construct_samples(
+                document_embeddings, batch['labels'], top_k=top_k
+            )
+            
+            return ((anchors, positive_samples, negative_samples), logits)
+            
+        logits = self.predictor(document_embeddings)
+        # logits = self.predictor(document_embeddings)
         return (None, logits)
 
 
 
 
+
+
 class ContextAwareMissingEmbeddingGenerator(nn.Module):
-    def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8):
+    def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, la_alpha=0.3, init_weight=0.5):
         super().__init__()
         self.bert = model
         # self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        self.la_alpha = la_alpha
         self.config = config
         self.input_size = self.config.hidden_size
         self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
@@ -295,6 +507,8 @@ class ContextAwareMissingEmbeddingGenerator(nn.Module):
         self.position_embeddings = nn.Embedding(num_sections, embedding_dim)
         self.section_weights = nn.Embedding(num_sections, embedding_dim)
         self.output_size = config.num_labels
+        self.weight = nn.Parameter(torch.tensor(init_weight))
+        self.sigmoid = nn.Sigmoid()
         # self.bert_model = bert_model
         # self.bert_config = bert_config
         # self.topk = topk
@@ -308,7 +522,7 @@ class ContextAwareMissingEmbeddingGenerator(nn.Module):
         nn.init.xavier_uniform_(self.section_weights.weight)
         
 
-    def forward(self, batch):
+    def forward(self, batch, do_contrastive_loss=False, memory_bank=None, max_negatives=5, mode='train'):
         device = self.missing_embeddings.weight.device
         # print(batch.keys())
         batch_size = len(batch['ehr_id'])
@@ -427,9 +641,251 @@ class ContextAwareMissingEmbeddingGenerator(nn.Module):
         section_embeddings = section_embeddings.to(device)
         document_embeddings = torch.mean(section_embeddings, dim=1)
         logits = self.predictor(document_embeddings)
+        if do_contrastive_loss == True and memory_bank is not None:
+            if mode == 'train':
+                memory_bank.update(document_embeddings, batch['labels'])
+
+            if memory_bank.has_sufficient_samples(min_samples_per_class=4):
+                # anchors, positive_samples, negative_samples, anchor_labels, pos_labels, neg_labels = construct_pairs(document_embeddings, batch['labels'], memory_bank)
+                anchors, positives, negatives, anchor_labels, pos_labels, neg_labels_groups = construct_pairs(document_embeddings, batch['labels'], memory_bank)
+
+                # print(f"Pass the check of the genereate: {pass_check}")
+                return ((anchors, positives, negatives), logits)
+            # check_pairs_labels(anchors,positive_samples,negative_samples)
+            
+
         # logits = logits.to(device)
         return (None, logits)
 
+    def _build_adjacency_matrix(self, section_embeddings, threshold=0.5, k=None):
+        """
+        动态生成邻接矩阵，支持稀疏化、对称化和孤立节点处理
+        :param section_embeddings: [batch_size, num_sections, embedding_dim]
+        :param threshold: 相似度阈值，用于稀疏化
+        :param k: top-k 相似邻居（可选）
+        :return: 邻接矩阵 A [batch_size, num_sections, num_sections]
+        """
+        # Step 1: 嵌入归一化
+        normalized_embeddings = F.normalize(section_embeddings, dim=-1)
+
+        # Step 2: 计算相似度矩阵
+        similarity_matrix = torch.einsum('bnd,bmd->bnm', normalized_embeddings, normalized_embeddings)
+
+        # Step 3: 稀疏化处理
+        if k is not None:
+            # 使用 top-k 稀疏化
+            topk_values, _ = torch.topk(similarity_matrix, k=k, dim=-1)
+            threshold = topk_values[:, :, -1].unsqueeze(-1)  # 获取每行的第 k 大值作为阈值
+            adjacency_matrix = (similarity_matrix >= threshold).float() * similarity_matrix
+        else:
+            # 使用固定阈值稀疏化
+            adjacency_matrix = (similarity_matrix >= threshold).float() * similarity_matrix
+
+        # Step 4: 对称化邻接矩阵
+        adjacency_matrix = (adjacency_matrix + adjacency_matrix.transpose(-1, -2)) / 2.0
+
+        # Step 5: 修正对角线（动态调整自连接权重）
+        degree_matrix = adjacency_matrix.sum(dim=-1, keepdim=True)  # 计算节点度
+        self_loop_weight = 1.0 / degree_matrix.clamp(min=1e-6)  # 动态调整自连接权重
+        self_loops = torch.eye(adjacency_matrix.size(-1), device=adjacency_matrix.device).unsqueeze(0) * self_loop_weight
+        adjacency_matrix += self_loops  # 添加自连接
+
+        # Step 6: 孤立节点处理（确保没有节点完全孤立）
+        isolation_mask = (adjacency_matrix.sum(dim=-1) == 0)  # 检查是否有孤立节点
+        if isolation_mask.any():
+            adjacency_matrix[isolation_mask] += torch.eye(adjacency_matrix.size(-1), device=adjacency_matrix.device)
+
+        # Step 7: 对邻接矩阵进行归一化（对称归一化）
+        degree_matrix = adjacency_matrix.sum(dim=-1, keepdim=True)  # 再次计算节点度
+        degree_matrix_inv_sqrt = torch.pow(degree_matrix, -0.5)
+        degree_matrix_inv_sqrt[torch.isinf(degree_matrix_inv_sqrt)] = 0.0  # 防止除零
+        adjacency_matrix = degree_matrix_inv_sqrt * adjacency_matrix * degree_matrix_inv_sqrt  # 对称归一化
+
+        return adjacency_matrix
+
+
+    def _laplacian_smoothing(self, section_embeddings, adjacency_matrix):
+        """
+        对嵌入应用图拉普拉斯平滑（向量化版本）
+        :param section_embeddings: [batch_size, num_sections, embedding_dim]
+        :param adjacency_matrix: [batch_size, num_sections, num_sections]
+        :return: 平滑后的 section_embeddings
+        """
+        batch_size, num_sections, embedding_dim = section_embeddings.shape
+
+        # Step 1: 计算度矩阵 D
+        degree_matrix = adjacency_matrix.sum(dim=-1)  # [batch_size, num_sections]
+        degree_matrix_inv = torch.diag_embed(1.0 / degree_matrix)  # [batch_size, num_sections, num_sections]
+
+        # Step 2: 计算拉普拉斯矩阵 L
+        laplacian_matrix = torch.eye(num_sections, device=adjacency_matrix.device).unsqueeze(0) \
+                        - torch.matmul(degree_matrix_inv, adjacency_matrix)  # [batch_size, num_sections, num_sections]
+
+        # Step 3: 应用拉普拉斯平滑
+        identity_matrix = torch.eye(num_sections, device=adjacency_matrix.device).unsqueeze(0)  # [1, num_sections, num_sections]
+        smoothing_matrix = identity_matrix - self.la_alpha * laplacian_matrix  # [batch_size, num_sections, num_sections]
+
+        smoothed_embeddings = torch.matmul(smoothing_matrix, section_embeddings)  # [batch_size, num_sections, embedding_dim]
+        return smoothed_embeddings
+    def _weighted_document_embedding(self, section_embeddings):
+        context_vector = torch.mean(section_embeddings, dim=1, keepdim=True)  # 全局上下文
+        attention_scores = torch.bmm(section_embeddings, context_vector.transpose(1, 2)).squeeze(-1)  # [batch_size, num_sections]
+        attention_weights = F.softmax(attention_scores, dim=-1)  # [batch_size, num_sections]
+        weighted_embedding = torch.sum(attention_weights.unsqueeze(-1) * section_embeddings, dim=1)  # 加权平均
+        return weighted_embedding
+    
+    def laplacian_forward(self, batch, do_contrastive_loss, memory_bank=None,max_negatives=4, mode='train'):
+        device = self.missing_embeddings.weight.device
+        # print(batch.keys())
+        batch_size = len(batch['ehr_id'])
+        num_sections = len(batch['sections'].keys())
+        section_names = list(batch['sections'].keys())
+        batch['labels'] = batch['labels'].to(device)
+        section_embeddings = torch.zeros((batch_size, num_sections, self.missing_embeddings.embedding_dim), device=device)
+        # print(f"Section Embedding shape: {section_embeddings.shape}")
+        existing_vectors = torch.zeros((batch_size, num_sections), dtype=torch.float, device=device)
+        # print(f"Existing_vectors shape: {existing_vectors.shape}")
+
+        for idx, section_name in enumerate(section_names):
+            section_data = batch['sections'][section_name]
+            #print(section_data.keys())
+            input_ids = section_data['input_ids']
+            attention_mask = section_data['attention_mask']
+            token_type_ids = section_data['token_type_ids']
+            
+            has_section = attention_mask.sum(dim=1) > 0
+            # print(f"has_section: {has_section}")
+
+            if has_section.any():
+                # print(f"Present Indices: {present_indices}")
+                present_indices = torch.where(has_section)[0].to(device)
+                # print(f"Present Indices: {present_indices}")
+                present_input_ids = input_ids[present_indices].to(device)
+                present_attention_mask = attention_mask[present_indices].to(device)
+                present_token_type_ids = token_type_ids[present_indices].to(device)
+
+                outputs = self.bert.bert(
+                    input_ids=present_input_ids, 
+                    attention_mask=present_attention_mask,
+                    token_type_ids=present_token_type_ids,
+                    position_ids=None,
+                    head_mask=None,
+                    inputs_embeds=None,
+                    output_attentions=None,
+                    output_hidden_states=None,
+                    return_dict=None
+                )
+                # 多线程处理来提速
+                cls_embeddings = outputs.last_hidden_state[:, 0, :]
+                cls_embeddings = cls_embeddings.to(device)
+                
+                for idx_in_present, ehr_idx in enumerate(present_indices):
+                    # print(f"idx in present: {idx_in_present}")
+                    # print(f"ehr_idx: {ehr_idx}")
+                    section_embeddings[ehr_idx, idx, :] = cls_embeddings[idx_in_present]
+                    existing_vectors[ehr_idx, idx] = 1  # 更新 existing_vectors
+
+            missing_indices = torch.where(~has_section)[0].to(device)
+            # print(f"Missing Indices: {missing_indices}")
+            if len(missing_indices) > 0:
+                missing_embeddings = self.missing_embeddings(torch.tensor(idx).to(device))
+                section_embeddings[missing_indices, idx, :] = missing_embeddings 
+            # print("-" * 120)
+        # print(f"Section Embedding shape: {section_embeddings.shape}")
+        # exit(0)
+        # print(f"Existing_vectors: {existing_vectors}")
+        # print(f"Initial Section Embeddings: {section_embeddings}'")
+        # print(f"Initial Section Embeddings shape: {section_embeddings.shape}")
+
+        for ehr_idx in range(batch_size):
+            ehr_embeddings = section_embeddings[ehr_idx]
+            # print(f"EHR_Embeddings: {ehr_embeddings}")
+            # print(f"EHR_Embeddings shape: {ehr_embeddings.shape}")
+            ehr_existence_vector = existing_vectors[ehr_idx]
+            # print(f"EHR_existence_vector: {ehr_existence_vector}")
+            # print(f"EHR_existence_vector shape: {ehr_existence_vector.shape}")
+            exist_indices = ehr_existence_vector.bool()
+
+            if exist_indices.sum() == 0:
+                continue
+            # print(f"Exist_indices: {exist_indices}")
+            exist_section_embeddings = ehr_embeddings[exist_indices]
+            # print(f"Exist_section_embeddings: {exist_section_embeddings}")
+            
+            # print(f"Exist_section_embeddings shape: {exist_section_embeddings.shape}")
+            exist_section_embeddings = exist_section_embeddings.unsqueeze(1)  # [20, 1, 768]
+            # print(f"Adjusted exist_section_embeddings: {exist_section_embeddings.shape}")
+
+            missing_indices = torch.where(~exist_indices)[0]
+            updated_ehr_embeddings = []
+
+            for idx_in_ehr_embeddings, embedding in enumerate(ehr_embeddings):
+                if idx_in_ehr_embeddings in missing_indices:
+                    # Get the index within missing_indices
+                    idx_in_missing = (missing_indices == idx_in_ehr_embeddings).nonzero(as_tuple=True)[0].item()
+
+                    # Prepare missing_embedding
+                    missing_embedding = embedding.unsqueeze(0).unsqueeze(1)  # Shape: [1, 1, embedding_dim]
+
+                    # Compute attention output
+                    attn_output, _ = self.attention_layer(
+                        query=missing_embedding,
+                        key=exist_section_embeddings,
+                        value=exist_section_embeddings
+                    )
+
+                    # Update embedding (no in-place operation)
+                    updated_embedding = attn_output.squeeze(0).squeeze(0)
+                else:
+                    # Keep the original embedding
+                    updated_embedding = embedding
+
+                # Append to the list
+                updated_ehr_embeddings.append(updated_embedding)
+
+            # Stack the updated embeddings to form a tensor
+            ehr_embeddings = torch.stack(updated_ehr_embeddings, dim=0)  # Shape: [num_sections, embedding_dim]
+
+            # Assign back to section_embeddings without in-place modification
+            section_embeddings = section_embeddings.clone()
+            section_embeddings[ehr_idx] = ehr_embeddings
+        
+        section_embeddings = section_embeddings.to(device)
+        # print(f"Raw Section Embedding shape: {section_embeddings.shape}")
+        # document_embeddings = torch.mean(section_embeddings, dim=1)
+
+        # Step 2: 动态生成邻接矩阵
+        adjacency_matrix = self._build_adjacency_matrix(section_embeddings, k=5)
+        '''print(f"Raw Section Embeddings: {section_embeddings}")
+        print(f"Raw Section shape: {section_embeddings.shape}")
+        print(f"Adjacency matrix: {adjacency_matrix}")
+        # Step 3: 图拉普拉斯平滑（向量化版本）'''
+        document_embeddings = self._laplacian_smoothing(section_embeddings, adjacency_matrix)
+        '''print(f"Smoothed Section Embeddings: {section_embeddings}")
+        print(f"Smoothed Section Shape: {section_embeddings.shape}")
+        exit(0)'''
+        # Step 4: 生成最终文档嵌入并进行分类
+        document_embeddings = torch.mean(section_embeddings, dim=1)  # 平均池化
+        # document_embeddings = self._weighted_document_embedding(section_embeddings)
+        logits = self.predictor(document_embeddings)
+        if do_contrastive_loss == True and memory_bank is not None and mode == 'train':
+            # print(f"Do add contrastive loss")
+            # print(f"Document Embedding shape: {document_embeddings.shape}")
+            memory_bank.update(document_embeddings, batch['labels'])
+
+            if memory_bank.has_sufficient_samples(min_samples_per_class=4):
+                anchors, positive_samples, negative_samples, __, __, __ = construct_pairs(document_embeddings, batch['labels'], 
+                                                                                          memory_bank,n_negatives=max_negatives)
+            
+            # print(f"Pass the check of the genereate: {pass_check}")
+                '''print(f"Anchor shape: {anchors.shape}")
+                print(f"Positive samples shape: {positive_samples.shape}")
+                print(f"Negative samples shape: {negative_samples.shape}")'''
+                return ((anchors, positive_samples, negative_samples), logits)
+            # check_pairs_labels(anchors,positive_samples,negative_samples)
+            
+        # logits = self.predictor(document_embeddings)
+        return (None, logits)
 
 class BertLongForSequenceClassification(BertForSequenceClassification):
 

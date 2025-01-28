@@ -25,7 +25,17 @@ from transformers.models.longformer.modeling_longformer import LongformerSelfAtt
 from outcome_models import BertLongForSequenceClassification, LitAugPredictorBienc, LitAugPredictorCrossenc, L2RLitAugPredictorBienc, \
         ContextAwareMissingEmbeddingGenerator, ContextAwareContrastiveEmbeddingGenerator
 from info_nce import InfoNCE, info_nce
-from contrastive_utils import tokenize_and_batch, main_training_loop, move_to_cuda, collate_fn, evaluate
+from contrastive_utils import tokenize_and_batch, main_training_loop, move_to_cuda, collate_fn, evaluate, MemoryBank, margin_orthogonal_loss, add_contrastive_loss
+import logging
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
+# 配置logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+import wandb
+
+wandb.login(key="d7c68693ef5c5723e30df705c6b36f60fc48fb85")
+
 
 def seed_torch(seed=1029):
     random.seed(seed)   # Python的随机性
@@ -113,8 +123,15 @@ def create_long_model(init_model, save_model_to, attention_window, max_pos, num_
 
 
 def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_steps, strategy,
-          use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment):
+          use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment, do_laplacian_augment, 
+          do_contrastive_loss=False, alpha=0.0, temperature=0.2, max_negatives=4, memory_bank_load_amount=8192):
     # print('Dropout default" {}'.format(model.config.hidden_dropout_prob))
+    if do_contrastive_loss:
+        memory_bank = MemoryBank(feature_dim=768, max_size=memory_bank_load_amount)
+        info_nce_loss = InfoNCE(temperature=temperature, reduction='mean', negative_mode='paired')
+    else:
+        memory_bank = None
+        info_nce_loss = None
     weights = torch.cuda.FloatTensor([x[1] for x in list(sorted(class_weights.items(), key=lambda x:x[0]))])
     weighted_ce_loss = nn.CrossEntropyLoss(weight=weights)
     print(f"Start Downstream Task Fine Tuning")
@@ -144,6 +161,7 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
         num_batches = len(train_data)
         num_train_examples = num_batches * batch_size
         for batch in train_data:
+
             if section_segment == False:
                 gpu_batch = {x:y.cuda() for x,y in batch.items()
                             if x not in ['ehr_id', 'pubmed_docs', 'pubmed_doc_weights',
@@ -160,14 +178,49 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
                 outputs = model(**gpu_batch)
             else:
                 gpu_batch = to_cuda(batch)
-                outputs = model(gpu_batch)
+                if do_laplacian_augment == True:
+                    outputs = model.laplacian_forward(gpu_batch, do_contrastive_loss=do_contrastive_loss, 
+                                                      memory_bank=memory_bank, max_negatives=max_negatives,mode='train')
+                else:
+                    outputs = model(gpu_batch, do_contrastive_loss=do_contrastive_loss, memory_bank=memory_bank, 
+                                    max_negatives=max_negatives, mode='train')
 
-        
             logits = outputs[1]
-
             wloss = weighted_ce_loss(logits, gpu_batch["labels"])
-            if outputs[0] is not None:
-                wloss += outputs[0]
+            metrics = {
+                "CrossEntropyLoss": wloss.item(),
+                "epoch": epoch + 1
+            }
+            '''print(f"Memory Bank Status: {memory_bank.has_sufficient_samples(min_samples_per_class=4)}")
+            print(f"Memory Bank class: {memory_bank.class_counts}")'''
+            if outputs[0] is not None and do_contrastive_loss == True and memory_bank.has_sufficient_samples(min_samples_per_class=max_negatives):
+                if step % 100 == 0:  # 监控memory bank状态
+                    status = memory_bank.get_status()
+                    print(f"Memory bank status:", status)
+                    print(f"Contrastive learning {'activated' if memory_bank.contrastive_loss_activated else 'not activated'}")
+                
+                # contrastive_loss = info_nce_loss(outputs[0]) + model.sigmoid(model.weight) * margin_orthogonal_loss(outputs[0][1], outputs[0][2]) 
+                contrastive_loss, adaptive_weight, ortho_loss = add_contrastive_loss(outputs, model, memory_bank, info_nce_loss, logger, step)
+                combined_loss = alpha * (contrastive_loss + adaptive_weight * ortho_loss)
+                wloss += combined_loss
+                
+                # 记录额外的指标
+                '''wandb.log({
+                    "contrastive_loss": contrastive_loss.item(),
+                    "total_samples_in_memory": len(memory_bank),
+                    "step": step ,
+                    "epoch": epoch + 1,
+                    "adaptive_weight": adaptive_weight,
+                    "ortho_loss": ortho_loss
+                })'''
+
+                metrics.update({
+                    "contrastive_loss": contrastive_loss.item(),
+                    "total_samples_in_memory": len(memory_bank),
+                    "adaptive_weight": adaptive_weight,
+                    "ortho_loss": ortho_loss,
+                    "train_loss": wloss.item() / acc_factor
+                })
             wloss /= acc_factor
             epoch_loss += wloss.item()
             wloss.backward()
@@ -176,10 +229,20 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
                 optimizer.step()
                 optimizer.zero_grad()
 
+            metrics.update({
+                "train_loss": wloss.item(),
+                "step": step
+            })
+            wandb.log(metrics)
+
+
             if step%val_steps == 0:
                 print('Completed {}/{} training steps'.format(step, num_train_examples))
                 dev_loss, auroc = test(model, dev_data, dump_test_preds, out_dir, epoch, step=step,
-                                       return_loss=True, class_weights=class_weights, strategy=strategy, section_segment=section_segment)
+                                       return_loss=True, class_weights=class_weights, strategy=strategy, section_segment=section_segment,
+                                       do_laplacian_augment=do_laplacian_augment, do_contrastive_loss=do_contrastive_loss,
+                                       memory_bank=memory_bank, info_nce_loss=info_nce_loss, max_negatives=max_negatives,
+                                       alpha=alpha)
                 if not stop_on_roc and dev_loss < prev_dev_loss: # stop on loss
                     prev_dev_loss = dev_loss
                     torch.save(model.state_dict(), os.path.join(out_dir, 'best_model.pt'))
@@ -207,7 +270,10 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
             'loss': epoch_loss,
         }, os.path.join(out_dir, 'checkpoints/checkpoint_{}.pt'.format(epoch)))
         dev_loss, auroc = test(model, dev_data, dump_test_preds, out_dir, epoch, step="end",
-                               return_loss=True, class_weights=class_weights, strategy=strategy, section_segment=section_segment)
+                               return_loss=True, class_weights=class_weights, strategy=strategy, section_segment=section_segment,
+                               do_laplacian_augment=do_laplacian_augment, do_contrastive_loss=do_contrastive_loss,
+                               memory_bank=memory_bank, info_nce_loss=info_nce_loss, max_negatives=max_negatives,
+                               alpha=alpha)
         if dev_loss < prev_dev_loss:
             prev_dev_loss = dev_loss
             torch.save(model.state_dict(), os.path.join(out_dir, 'best_model.pt'))
@@ -215,7 +281,8 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
 
 
 def test(model, dev_data, dump_test_preds, out_dir, epoch, step,
-         return_loss=False, class_weights=None, strategy='average', section_segment=False):
+         return_loss=False, class_weights=None, strategy='average', section_segment=False, do_laplacian_augment=False,
+         do_contrastive_loss=False, memory_bank=None, info_nce_loss=None, max_negatives=4, alpha=0):
     with torch.no_grad():
         model.eval()
         unique_labels = list(class_weights.keys())
@@ -243,7 +310,14 @@ def test(model, dev_data, dump_test_preds, out_dir, epoch, step,
                 outputs = model(**gpu_batch)
             else:
                 gpu_batch = to_cuda(batch)
-                outputs = model(gpu_batch)
+                if do_laplacian_augment == True:
+                    outputs = model.laplacian_forward(gpu_batch,do_contrastive_loss=do_contrastive_loss,
+                                                      memory_bank=memory_bank, max_negatives=max_negatives, mode='test')
+                else:
+                    outputs = model(gpu_batch, do_contrastive_loss=do_contrastive_loss,
+                                    memory_bank=memory_bank, max_negatives=max_negatives, mode='test')
+            
+            
             logits = outputs[1]
             all_preds += torch.argmax(logits, dim=1).detach().cpu().numpy().tolist()
             probs = softmax(logits) if 'average' in strategy else torch.exp(logits)
@@ -251,6 +325,21 @@ def test(model, dev_data, dump_test_preds, out_dir, epoch, step,
             probs = probs if len(unique_labels) > 2 else probs[:,1]
             
             wloss = weighted_ce_loss(logits, gpu_batch["labels"])
+            if outputs[0] is not None and do_contrastive_loss == True and memory_bank.has_sufficient_samples(min_samples_per_class=max_negatives) and step != 'test':
+                # contrastive_loss = info_nce_loss(outputs[0]) + model.sigmoid(model.weight) * margin_orthogonal_loss(outputs[0][1], outputs[0][2]) 
+                contrastive_loss, adaptive_weight, ortho_loss = add_contrastive_loss(outputs, model, memory_bank, info_nce_loss, logger, step)
+                combined_loss = alpha * (contrastive_loss + adaptive_weight * ortho_loss)
+                wloss += combined_loss
+                
+                # 记录额外的指标
+                '''wandb.log({
+                    "validation_contrastive_loss": contrastive_loss.item(),
+                    "total_samples_in_memory": len(memory_bank),
+                    "step": step,
+                    "epoch": epoch + 1,
+                    "adaptive_weight": adaptive_weight,
+                    "valiadation_ortho_loss": ortho_loss
+                })'''
             dev_loss += wloss.item()
             all_pred_probs += probs.detach().cpu().numpy().tolist()
             all_labels += gpu_batch["labels"].cpu().numpy().tolist()
@@ -267,6 +356,48 @@ def test(model, dev_data, dump_test_preds, out_dir, epoch, step,
     print('------------------Validation Scores for Epoch {}-------------------'.format(epoch))
     for metric_name, metric_value in metrics_dict.items():
         print(f'{metric_name}: {metric_value}')
+
+    # 记录验证指标到 WandB
+    # 设置映射逻辑：如果是字符串，则映射为固定的数值
+    # 初始化 log_data
+    log_data = {}
+
+    # 检查 epoch 和 step 是否为特殊标记
+    if epoch == "end" and step == "test":
+        # 将 metrics_dict 的结果归类到 test/ 下
+        for metric_name, metric_value in metrics_dict.items():
+            metric_name = str(metric_name)
+            if isinstance(metric_value, dict):
+                metric_value = {str(k): float(v) for k, v in metric_value.items()}
+            elif hasattr(metric_value, 'item'):
+                metric_value = metric_value.item()
+            log_data[f"test/{metric_name}"] = metric_value
+        
+        # 记录验证损失到 test/ 下
+        log_data["test/validation_loss"] = float(dev_loss)
+
+    else:
+        # 正常记录训练阶段的结果
+        log_data = {
+            "validation_loss": float(dev_loss),
+            "epoch": int(epoch) if isinstance(epoch, int) else str(epoch),
+            "step": int(step) if isinstance(step, int) else str(step),
+        }
+
+        # 将 metrics_dict 的结果添加到 log_data 中
+        for metric_name, metric_value in metrics_dict.items():
+            metric_name = str(metric_name)
+            if isinstance(metric_value, dict):
+                metric_value = {str(k): float(v) for k, v in metric_value.items()}
+            elif hasattr(metric_value, 'item'):
+                metric_value = metric_value.item()
+            log_data[f"validation/{metric_name}"] = metric_value
+
+    # 记录到 wandb
+    wandb.log(log_data)
+
+
+
     auroc = metrics_dict["ROC AUC"]
     if return_loss:
         return dev_loss, auroc
@@ -518,9 +649,42 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         use_warmup, warmup_steps, stop_on_roc, dump_test_preds, use_pico, doc_embeds, l2r_top_docs,
         outcome, retrieval_labels, query_proj, query_loss, num_head=0, section_segment=False, do_contrastive=False, 
         max_negatives=10, contrastive_epochs=20, contrastive_batch_size=8, alpha=0.1, temperature=0.1,negative_pair_strategy='normal',
-        max_samples_per_outcome=1000, contrastive_lr=1e-5,section_selection='important',contrastive_checkpoint_dir=None):
+        max_samples_per_outcome=1000, contrastive_lr=1e-5,section_selection='full',trained_contrastive_checkpoint_dir=None,
+        do_laplacian_augment=False, la_alpha=0.0,do_contrastive_loss=False, memory_bank_load_amount=8192):
 
     assert accumulation_steps % batch_size == 0, "accumulation_steps must be a multiple of batch_size"
+    if trained_contrastive_checkpoint_dir == "None":
+        trained_contrastive_checkpoint_dir = None
+    section_names = [
+            'discharge diagnosis', 'major surgical or invasive procedure', 'history of present illness',
+            'past medical history', 'brief hospital course', 'chief complaint', 'family history',
+            'physical exam', 'admission date', 'discharge date', 'service', 'date of birth',
+            'sex', 'allergies', 'social history', 'discharge disposition', 'discharge medications',
+            'medications on admission', 'attending', 'discharge condition', 'discharge instructions',
+            'followup instructions', 'pertinent results'
+        ]
+    refined_section_names = ['discharge diagnosis', 'major surgical or invasive procedure', 'history of present illness',
+            'past medical history', 'brief hospital course', 'chief complaint', 'family history',
+            'physical exam', 'service', 'date of birth', 'sex', 'allergies', 'social history', 'discharge disposition', 
+            'discharge medications', 'medications on admission', 'attending', 'discharge condition', 'discharge instructions',
+            'followup instructions', 'pertinent results']
+    
+    admission_names = ['chief complaint', 'allergies', 'social history', 'medications on admission', 'past medical history'
+                              'physical exam', 'family history', 'medical history']
+    
+    selected_sections = None
+    if section_selection == 'full':
+        selected_sections = section_names
+    elif section_selection == 'refine':
+        selected_sections = refined_section_names
+    else:
+        selected_sections = admission_names
+
+    print(f"Number of sections selected: {len(selected_sections)}")
+        
+    
+
+
     if longmodel_dir is not None and not os.path.exists(longmodel_dir):
         os.makedirs(longmodel_dir)
     if not os.path.exists(out_dir):
@@ -537,7 +701,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
                          'pmv': 'What is the probability of prolonged mechanical ventilation? ',
                          'los': 'What is the probable length of stay? '}
 
-    dataset = EHRDataset(train_path, dev_path, test_path, do_train, do_test, section_segment)
+    dataset = EHRDataset(train_path, dev_path, test_path, do_train, do_test, section_segment,selected_sections=selected_sections)
     
     # print(dataset)
     
@@ -649,18 +813,18 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         # Step 4: use custom class to extend the base model
         print(f"Create Section-Based Model")
         if do_contrastive:
-            if contrastive_checkpoint_dir is None:
-                model = ContextAwareContrastiveEmbeddingGenerator(config=config, model=model)
+            if trained_contrastive_checkpoint_dir is None:
+                model = ContextAwareContrastiveEmbeddingGenerator(config=config, model=model, num_sections=len(selected_sections), la_alpha=la_alpha)
             else:
                 # 创建模型实例（与保存时的架构和配置一致）
                 model = ContextAwareContrastiveEmbeddingGenerator(config=config)
 
                 # 加载模型权重
-                checkpoint = torch.load(os.path.join(contrastive_checkpoint_dir, 'best_model.pt'))
+                checkpoint = torch.load(os.path.join(trained_contrastive_checkpoint_dir, 'best_model.pt'))
                 model.load_state_dict(checkpoint['model_state_dict'])  # 只加载模型参数
 
         else:
-            model = ContextAwareMissingEmbeddingGenerator(config=config, model=model)
+            model = ContextAwareMissingEmbeddingGenerator(config=config, model=model,num_sections=len(selected_sections), la_alpha=la_alpha)
     else:
         if lit_ranks is not None and doc_embeds is None: # we're training with literature, and we don't use existing embeddings
             if enc_strategy == 'bienc':
@@ -772,7 +936,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
                 print('Created {} batches'.format(len(batches)), end="\r", flush=True)
         return batches
 
-    def section_preprocess_function(batch, tokenizer, max_length=512):
+    def section_preprocess_function(batch, tokenizer, max_length=512, section_names=None):
         """
         对一个 batch 的数据进行分词和编码，优化以利用 tokenizer 的批量处理能力。
         
@@ -786,14 +950,14 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         - batch_result: dict，包含分词后的批次数据，包括对缺失部分的处理。
         """
         # 初始化用于保存所有 EHR 分词结果的结构
-        section_names = [
+        '''section_names = [
             'discharge diagnosis', 'major surgical or invasive procedure', 'history of present illness',
             'past medical history', 'brief hospital course', 'chief complaint', 'family history',
             'physical exam', 'admission date', 'discharge date', 'service', 'date of birth',
             'sex', 'allergies', 'social history', 'discharge disposition', 'discharge medications',
             'medications on admission', 'attending', 'discharge condition', 'discharge instructions',
             'followup instructions', 'pertinent results'
-        ]
+        ]'''
 
         '''section_names = ['discharge diagnosis', 'major surgical or invasive procedure', 'history of present illness',
             'past medical history', 'brief hospital course', 'chief complaint', 'family history',
@@ -801,7 +965,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
             'discharge medications', 'medications on admission', 'attending', 'discharge condition', 'discharge instructions',
             'followup instructions', 'pertinent results']'''
         '''admission_names = ['chief complaint', 'allergies', 'social history', 'medications on admission', 'past medical history'
-                              'physical exam', 'family history', 'medical history', ]'''
+                              'physical exam', 'family history', 'medical history']'''
 
 
         batch_result = {
@@ -883,7 +1047,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         # verify_cuda_transfer(batch_result)
         return batch_result
 
-    def section_batch_and_tokenizer_data(examples, tokenizer, batch_size, split):
+    def section_batch_and_tokenizer_data(examples, tokenizer, batch_size, split, section_names):
         example_list = []
         for file in list(examples.keys()):
             example = examples[file]
@@ -897,7 +1061,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
             end = min(start + batch_size, len(example_list))
             
             # print(len(example_list[start:end]))
-            batch = section_preprocess_function(example_list[start:end], tokenizer)
+            batch = section_preprocess_function(example_list[start:end], tokenizer, section_names=section_names)
             batches.append(batch)
 
             if len(batches) % 100 == 0:
@@ -914,17 +1078,17 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
             dev_batches = batch_and_tokenize_data(dataset.dev_data, batch_size, 'dev')
             print('Created {} dev batches'.format(len(dev_batches)))
         else:
-            train_batches = section_batch_and_tokenizer_data(dataset.train_data, tokenizer, batch_size, 'train')
+            train_batches = section_batch_and_tokenizer_data(dataset.train_data, tokenizer, batch_size, 'train', section_names=selected_sections)
             print('Created {} Section-based train batches'.format(len(train_batches)))
             # dev_batches = train_batches
-            dev_batches = section_batch_and_tokenizer_data(dataset.dev_data, tokenizer, batch_size, 'dev')
+            dev_batches = section_batch_and_tokenizer_data(dataset.dev_data, tokenizer, batch_size, 'dev', section_names=selected_sections)
             print('Created {} Section-based dev batches'.format(len(dev_batches)))
     if do_test:
         if section_segment == False:
             test_batches = batch_and_tokenize_data(dataset.test_data, batch_size, 'test')
             print('Created {} test batches'.format(len(test_batches)))
         else:
-            test_batches = section_batch_and_tokenizer_data(dataset.test_data, tokenizer, batch_size, 'test')
+            test_batches = section_batch_and_tokenizer_data(dataset.test_data, tokenizer, batch_size, 'test', section_names=selected_sections)
             # test_batches = dev_batches
             print('Created {} Section-based test batches'.format(len(test_batches)))
             # print("Pass")
@@ -936,7 +1100,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         if not os.path.exists(contrastive_checkpoint_dir):
             os.makedirs(contrastive_checkpoint_dir)
         print(f"Contrastive checkpoint dir: {contrastive_checkpoint_dir}")
-        preprocessed_data = dataset.preprocess_ehr_data_with_sampling(dataset.train_data, max_samples_per_outcome=max_samples_per_outcome, section_selection=section_selection)
+        preprocessed_data = dataset.preprocess_ehr_data_with_sampling(dataset.train_data, max_samples_per_outcome=max_samples_per_outcome)
         # dev_preprocessed_data = dataset.preprocess_ehr_data_with_sampling(dataset.dev_data, max_samples_per_outcome=max_samples_per_outcome)
         
         if negative_pair_strategy == 'refine':
@@ -944,7 +1108,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
             # print(f"Number of contrastive training data: {len(contrastive_data)}")
             # eval_data = dataset.add_contrastive_data_optimized(dev_preprocessed_data, max_negatives=max_negatives)
         elif negative_pair_strategy == 'final':
-            contrastive_data = dataset.add_contrastive_data_multiclass_diff_section_negatives(preprocessed_data, max_negatives)
+            contrastive_data = dataset.add_contrastive_data_multiclass_efficient(preprocessed_data, max_negatives)
         elif negative_pair_strategy == 'balance':
             print(f"Used the balanced section selection methods!")
             contrastive_data = dataset.add_contrastive_data_multiclass_diff_section_negatives_with_min_section(preprocessed_data, max_negatives)
@@ -959,7 +1123,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         dataloader = DataLoader(tokenized_data, 
                                 batch_size=contrastive_batch_size, 
                                 collate_fn=collate_fn,
-                                num_workers=8,  # 根据服务器的 CPU 核心数调整
+                                num_workers=4,  # 根据服务器的 CPU 核心数调整
                                 pin_memory=True)
         '''eval_dataloader = DataLoader(dev_tokenized_data, 
                                     batch_size=contrastive_batch_size, 
@@ -969,7 +1133,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
 
         print("Start Contrastive Training!")
         main_training_loop(dataloader, model, contrastive_checkpoint_dir, alpha, num_epochs=contrastive_epochs, 
-                           temperature=temperature, contrastive_lr=contrastive_lr, contrastive_checkpoint_dir=contrastive_checkpoint_dir)
+                           temperature=temperature, contrastive_lr=contrastive_lr, trained_contrastive_checkpoint_dir=trained_contrastive_checkpoint_dir)
         print("Contrastive Training Finished!")
 
         best_checkpoint_path = os.path.join(contrastive_checkpoint_dir, "best_model.pt")
@@ -980,7 +1144,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         
         if do_train:
             train(model, train_batches, dev_batches, out_dir, epochs, lr, dataset.class_weights,
-                  accumulation_steps, strategy, use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment)
+                  accumulation_steps, strategy, use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment,do_laplacian_augment, do_contrastive_loss)
         if do_test:
             if  checkpoint is not None:
                     if 'checkpoint' in checkpoint:
@@ -991,12 +1155,14 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
                         print('Loaded checkpoint')
             else:
                 model.load_state_dict(torch.load(os.path.join(out_dir, 'best_model.pt')))
-                test(model, test_batches, dump_test_preds, out_dir, epoch="end", step="test",
-                    class_weights=dataset.class_weights, strategy=strategy, section_segment=section_segment)
+
+            test(model, test_batches, dump_test_preds, out_dir, epoch="end", step="test",
+                    class_weights=dataset.class_weights, strategy=strategy, section_segment=section_segment, do_laplacian_augment=do_laplacian_augment)
     else:
         if do_train:
             train(model, train_batches, dev_batches, out_dir, epochs, lr, dataset.class_weights,
-                accumulation_steps, strategy, use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment)
+                accumulation_steps, strategy, use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment, do_laplacian_augment, 
+                do_contrastive_loss=do_contrastive_loss, alpha=alpha, temperature=temperature, max_negatives=max_negatives, memory_bank_load_amount=memory_bank_load_amount)
         if do_test:
             if checkpoint is not None:
                 if 'checkpoint' in checkpoint:
@@ -1007,8 +1173,9 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
                     print('Loaded checkpoint')
             else:
                 model.load_state_dict(torch.load(os.path.join(out_dir, 'best_model.pt')))
+            
             test(model, test_batches, dump_test_preds, out_dir, epoch="end", step="test",
-                class_weights=dataset.class_weights, strategy=strategy, section_segment=section_segment)
+                class_weights=dataset.class_weights, strategy=strategy, section_segment=section_segment, do_laplacian_augment=do_laplacian_augment)
 
 if __name__ == '__main__':
 
@@ -1059,17 +1226,42 @@ if __name__ == '__main__':
     parser.add_argument('--max_negatives', type=int, action='store', default=5, help='number of negatives for each anchor in contrastive learning')
     parser.add_argument('--contrastive_epochs', type=int, action='store', default=20, help='number of epochs for contrastive learning')
     parser.add_argument('--contrastive_batch_size', type=int, action='store', default=8, help='batch size for contrastive learning')
-    parser.add_argument('--alpha', type=float, action='store', default=0.0, help='weighte of the orthogonoal loss')
+    parser.add_argument('--alpha', type=float, action='store', default=0.2, help='weighte of contrastive loss')
     parser.add_argument('--temperature', type=float, action='store', default=0.1, help='temperature of the contrastive loss')
-    parser.add_argument('--negative_pair_strategy', type=str, action='store', default='normal', help='strategy to sample the negative pair')
+    parser.add_argument('--negative_pair_strategy', type=str, action='store', default='final', help='strategy to sample the negative pair')
     parser.add_argument('--max_samples_per_outcome', type=int, action='store', default=800, help='number of sample for each outcome in preprocess')
     parser.add_argument('--contrastive_lr', type=float, action='store', default=1e-5, help='learning rate for contrastive learning')
-    parser.add_argument('--section_selection', type=str, action='store', default='important', help='selected sections for contrastive learning')
-    parser.add_argument('--contrastive_checkpoint_dir', type=str, action='store_true', help='saved contrastive trained model')
+    parser.add_argument('--section_selection', type=str, action='store', default='full', help='selected sections for contrastive learning')
+    parser.add_argument('--trained_contrastive_checkpoint_dir', type=str, action='store', default=None, help='saved contrastive trained model')
+    parser.add_argument('--do_laplacian_augment', action='store_true', default=False, help='if use laplacian to create the graph')
+    parser.add_argument('--la_alpha', type=float, action='store', default=0.3, help='laplacian smooth index')
+    parser.add_argument('--do_contrastive_loss', action='store_true', default=False, help='if add the contrastive loss to the CrossEntropy Loss')
+    parser.add_argument('--memory_bank_load_amount', type=int, action='store', default=8192, help='total number of features for memory bank to keep')
     # parser.add_argument('--do_train', action='store_true', default=False, help='Specify if training should be performed')
     args = parser.parse_args()
     args_dict = vars(args)
 
+    # do_long = args.longmodel_dir is not None
+    wandb.init(
+            project="Structured-Aware Clinical Note Processing",  # 项目名称
+            entity="nkw3mr-university-of-virginia",  # 你的 WandB 用户名或团队名
+            config={
+                "do_contrastive_loss": args.do_contrastive_loss,
+                "do_laplacian_augment": args.do_laplacian_augment,
+                "la_alpha": args.la_alpha,
+                "section_selection": args.section_selection,
+                "section_segment": args.section_segment,
+                "model": args.init_model,
+                "do_long": args.longmodel_dir is not None,
+                "contrastive_weight": args.alpha,
+                "temperature": args.temperature,
+                "max_negatives": args.max_negatives,
+                "memory_bank_load_amount": args.memory_bank_load_amount
+            }
+        )  # 直接同步所有超参数
+
+
+    # 同步 args 到 wandb.config
 
     print(f"run name: {args_dict['run_name']}")
     for key, value in args_dict.items():
@@ -1078,3 +1270,4 @@ if __name__ == '__main__':
     args_dict = vars(args)
     args_dict.pop("run_name")
     run(**args_dict)
+    wandb.finish()

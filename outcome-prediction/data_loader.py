@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 class EHRDataset:
 
-    def __init__(self, train_path, dev_path, test_path, do_train=True, do_test=True, section_segment=False, task_type='mp'):
+    def __init__(self, train_path, dev_path, test_path, do_train=True, do_test=True, section_segment=False, task_type='mp', selected_sections=None):
         assert do_train or do_test, "if no train and no test, which data should it loads?"
         if section_segment:
             self.train_data = self.read_json(train_path)
@@ -21,7 +21,9 @@ class EHRDataset:
             self.train_data = self.read_csv(train_path)
             self.dev_data = self.read_csv(dev_path)
             self.test_data = self.read_csv(test_path)
-        self.important_sections = ['discharge diagnosis','major surgical or invasive procedure','history of present illness',
+        self.selected_sections = selected_sections
+        print(f"Numebr of selected section in datadataset: {len(self.selected_sections)}")
+        '''self.important_sections = ['discharge diagnosis','major surgical or invasive procedure','history of present illness',
                                     'past medical history','brief hospital course','chief complaint','physical exam',
                                     'discharge medications','discharge disposition','medications on admission',
                                     'discharge instructions','followup instructions']
@@ -32,7 +34,7 @@ class EHRDataset:
             'sex', 'allergies', 'social history', 'discharge disposition', 'discharge medications',
             'medications on admission', 'attending', 'discharge condition', 'discharge instructions',
             'followup instructions', 'pertinent results'
-        ]
+        ]'''
         # self.contrastive_data = self.add_contrastive_data(task_type='multi-class')
         self.do_train = do_train
         self.do_test = do_test
@@ -144,7 +146,7 @@ class EHRDataset:
 
     
     
-    def preprocess_ehr_data_with_sampling(self, data, max_samples_per_outcome=1000, section_selection='full'):
+    def preprocess_ehr_data_with_sampling(self, data, max_samples_per_outcome=1000):
         """
         预处理 EHR 数据并对每个 section/outcome 采样，限制数据总量。
         Args:
@@ -155,15 +157,10 @@ class EHRDataset:
             processed_data: 预处理后的数据，格式为 {section_name: {outcome: list of samples}}。
         """
         processed_data = defaultdict(lambda: defaultdict(list))
-        if section_selection == 'full':
-            selected_sections = self.full_sections
-        else:
-            selected_sections = self.important_sections
-
         # 遍历原始数据并筛选重要 section
         for ehr_id, ehr in data.items():
             outcome = ehr['outcome']
-            filtered_ehr = {k: v for k, v in ehr['ehr'].items() if k in selected_sections and v.strip()}
+            filtered_ehr = {k: v for k, v in ehr['ehr'].items() if k in self.selected_sections and v.strip()}
             for section_name, content in filtered_ehr.items():
                 processed_data[section_name][outcome].append({
                     'ehr_id': ehr_id,

@@ -4,6 +4,219 @@ from info_nce import InfoNCE, info_nce
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import os
+from collections import deque
+from typing import Dict, Optional, Tuple
+import random
+def add_contrastive_loss(outputs, model, memory_bank, info_nce_loss, logger, step):
+    # 获取特征
+    anc_features = outputs[0][0]  # anchor sample
+    pos_features = outputs[0][1]  # 正样本特征
+    neg_features = outputs[0][2]  # 负样本特征
+    '''print(f"Anchor Features type: {type(anc_features)}")
+    print(f"Anchor Features shape: {anc_features.shape}")
+    print(f"Positive Features type:  {type(pos_features)}")
+    print(f"Positive Features shape: {pos_features.shape}")
+    print(f"Negative Features type:  {type(neg_features)}")
+    print(f"Negative Features shape: {neg_features.shape}")'''
+    # 计算损失
+    adaptive_weight = model.sigmoid(model.weight)
+    contrastive_loss = info_nce_loss(anc_features, pos_features, neg_features)
+    ortho_loss = margin_orthogonal_loss(pos_features, neg_features)
+    
+    return contrastive_loss, adaptive_weight, ortho_loss
+
+
+def margin_orthogonal_loss(pos_features, neg_features, margin=0.1, epsilon=1e-8):
+   # neg_features is already [batch_size, num_neg, feature_dim]
+   # pos_features is [batch_size, feature_dim]
+   
+   diffs = pos_features.unsqueeze(1) - neg_features  # [batch_size, num_neg, feature_dim]
+   
+   # 归一化
+   norms = torch.norm(diffs, dim=2, keepdim=True)
+   diffs_normalized = diffs / (norms + epsilon)
+   
+   # 批量计算内积 [batch_size, num_neg, num_neg]
+   inner_products = torch.bmm(
+       diffs_normalized,
+       diffs_normalized.transpose(1, 2)
+   )
+   
+   # 只取上三角部分
+   mask = torch.triu(torch.ones_like(inner_products), diagonal=1)
+   loss = torch.mean(torch.relu(torch.abs(inner_products) * mask - margin))
+   
+   return loss
+
+def check_pairs_labels(anchor_features, positive_features, negative_features, anchor_labels, memory_bank=None):
+    batch_size = anchor_features.shape[0]
+    
+    for i in range(batch_size):
+        # 检查positive pair
+        if anchor_labels[i] != anchor_labels[i]:  # 使用anchor_labels因为positive sample应该与anchor同类
+            print(f"错误: anchor {i} (label={anchor_labels[i]}) 和 positive sample (label={anchor_labels[i]}) 标签不同")
+        
+        # 检查negative pairs
+        for j in range(negative_features.shape[1]):
+            if anchor_labels[i] == anchor_labels[i]:  # 同理使用anchor_labels
+                print(f"错误: anchor {i} (label={anchor_labels[i]}) 和 negative sample {j} 标签相同")
+    
+    return True
+
+def construct_pairs(features, labels, memory_bank, n_negatives=4, device='cuda'):
+    """
+    构造对比学习的样本对，每个anchor对应一个positive和多个negative samples
+    Args:
+        features: 当前batch的特征 [batch_size, feature_dim]
+        labels: 当前batch的标签
+        memory_bank: 存储历史特征的memory bank
+        n_negatives: 每个anchor选择的负样本数量
+    Returns:
+        anchors: [N, feature_dim]
+        positives: [N, feature_dim]
+        negatives: [N, n_negatives, feature_dim]  # 关键改动：增加一个维度
+    """
+    anchors = []
+    pos_features = []
+    neg_features_groups = []  # 存储每个anchor的多个negative samples
+    anchor_labels = []
+    pos_labels = []
+    neg_labels_groups = []
+    
+    for i, (feat, label) in enumerate(zip(features, labels)):
+        memory_feats, memory_labels = memory_bank.get_samples(
+            current_labels=[label],
+            exclude_labels=None
+        )
+        
+        if len(memory_feats) == 0:
+            continue
+            
+        pos_indices = [i for i, l in enumerate(memory_labels) if l == label]
+        neg_indices = [i for i, l in enumerate(memory_labels) if l != label]
+        
+        if len(pos_indices) == 0 or len(neg_indices) < n_negatives:
+            continue
+        
+        # 为每个anchor选择一个positive
+        pos_idx = random.choice(pos_indices)
+        # 选择多个negatives
+        neg_idxs = random.sample(neg_indices, n_negatives)
+        
+        # 收集样本
+        anchors.append(feat.to(device))
+        pos_features.append(memory_feats[pos_idx].to(device))
+        # 收集这个anchor的所有negative samples
+        curr_neg_features = [memory_feats[idx].to(device) for idx in neg_idxs]
+        neg_features_groups.append(torch.stack(curr_neg_features))
+        
+        # 收集标签
+        anchor_labels.append(label)
+        pos_labels.append(memory_labels[pos_idx])
+        neg_labels_groups.append([memory_labels[idx] for idx in neg_idxs])
+    
+    if not anchors:
+        return torch.empty(0,features.size(1)), torch.empty(0,features.size(1)), \
+               torch.empty(0,features.size(1),0), [], [], []
+    
+    # 将列表转换为tensor，注意negative samples多一个维度
+    anchors = torch.stack(anchors)  # [N, feature_dim]
+    positives = torch.stack(pos_features)  # [N, feature_dim]
+    negatives = torch.stack(neg_features_groups)  # [N, n_negatives, feature_dim]
+    
+    return (anchors, positives, negatives, 
+            anchor_labels, pos_labels, neg_labels_groups)
+
+class MemoryBank:
+    def __init__(self, feature_dim: int, max_size: int = 8192, momentum: float = 0.9):
+        self.feature_dim = feature_dim
+        self.max_size = max_size
+        self.momentum = momentum
+        
+        # 为每个类别维护独立的deque
+        self.features_per_class = {}  # Dict[label, deque]
+        self.class_counts = {}
+        
+        # 计算每个类别的最大样本数
+        self.samples_per_class = max_size // 10  # 假设最多10个类别，可以根据实际情况调整
+        self.contrastive_loss_activated = False
+    
+    def get_samples(self, current_labels: list, n_samples: Optional[int] = None, exclude_labels: list = None):
+        if not self.features_per_class:
+            return torch.empty(0, self.feature_dim), []
+            
+        # 收集所有可用样本
+        all_features = []
+        all_labels = []
+        
+        exclude_labels = exclude_labels or []
+        available_classes = [label for label in self.features_per_class.keys() 
+                           if label not in exclude_labels]
+        
+        if not available_classes:
+            return torch.empty(0, self.feature_dim), []
+            
+        # 从每个类别中收集样本
+        for label in available_classes:
+            features = list(self.features_per_class[label])
+            all_features.extend(features)
+            all_labels.extend([label] * len(features))
+            
+        # 转换为tensor
+        features_tensor = torch.tensor(all_features)
+        
+        # 如果需要限制样本数量
+        if n_samples is not None and len(features_tensor) > n_samples:
+            # 确保每个类别都有代表
+            samples_per_class = n_samples // len(available_classes)
+            selected_features = []
+            selected_labels = []
+            
+            for label in available_classes:
+                class_indices = [i for i, l in enumerate(all_labels) if l == label]
+                selected_indices = class_indices[:samples_per_class]
+                selected_features.append(features_tensor[selected_indices])
+                selected_labels.extend([label] * len(selected_indices))
+            
+            features_tensor = torch.cat(selected_features)
+            all_labels = selected_labels
+            
+        return features_tensor, all_labels
+        
+    def __len__(self) -> int:
+        return sum(self.class_counts.values())
+    
+    def has_sufficient_samples(self, min_samples_per_class: int = 4):
+        sufficient = all(count >= min_samples_per_class for count in self.class_counts.values())
+        
+        # 一旦达到条件就永久激活
+        if sufficient and not self.contrastive_loss_activated:
+            self.contrastive_loss_activated = True
+            print("Contrastive learning activated!")
+            
+        return self.contrastive_loss_activated or sufficient
+    
+    def update(self, features: torch.Tensor, labels: list, update_existing: bool = True):
+        features = features.detach().cpu()
+
+        for feat, label in zip(features, labels):
+            label_key = label.item() if isinstance(label, torch.Tensor) else label  # 转换tensor为普通数字
+
+            if label_key not in self.features_per_class:
+                self.features_per_class[label_key] = deque(maxlen=self.samples_per_class)
+                self.class_counts[label_key] = 0
+
+            self.features_per_class[label_key].append(feat.tolist())
+            self.class_counts[label_key] = len(self.features_per_class[label_key])
+
+    def get_status(self):
+        """获取memory bank的当前状态"""
+        return {
+            'total_samples': len(self),
+            'samples_per_class': dict(self.class_counts),
+            'max_size_per_class': self.samples_per_class,
+            'is_activated': self.contrastive_loss_activated
+        }
 
 def move_to_cuda(batch):
     for k, v in batch['anchor'].items():
@@ -39,8 +252,9 @@ def tokenize_and_batch(sample, tokenizer, max_length=512):
     }
 
 def main_training_loop(dataloader, model, checkpoint_dir, alpha, num_epochs=3, patience=3, temperature=0.1, 
-                       contrastive_lr=1e-5, delta=5e-3, contrastive_checkpoint_dir=None):
+                       contrastive_lr=1e-5, delta=5e-3, trained_contrastive_checkpoint_dir=None):
     # writer = SummaryWriter(log_dir='test_contrastive_log_dir')
+
     info_nce_loss = InfoNCE(negative_mode='paired', temperature=temperature)
     print_interval = 100
     optimizer = optim.Adam(model.parameters(), lr=contrastive_lr,weight_decay=1e-4)
@@ -50,8 +264,8 @@ def main_training_loop(dataloader, model, checkpoint_dir, alpha, num_epochs=3, p
     start_epoch = 0
     epochs_no_improve = 0
 
-    if contrastive_checkpoint_dir is not None:
-        checkpoint = torch.load(os.path.join(contrastive_checkpoint_dir, 'best_model.pt'))
+    if trained_contrastive_checkpoint_dir is not None:
+        checkpoint = torch.load(os.path.join(trained_contrastive_checkpoint_dir, 'best_model.pt'))
         model.load_state_dict(checkpoint['model_state_dict'])  # 加载模型参数
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])  # 加载优化器状态
         if 'scheduler_state_dict' in checkpoint:
