@@ -263,12 +263,12 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
                 print(f"{step} steps + validation took {elapsed_so_far//60} minutes, ETA for epoch: {ETA//60} minutes")
         epoch_loss /= (len(train_data)/acc_factor)
         print('Training loss after epoch {}: {}'.format(epoch, epoch_loss))
-        torch.save({
+        '''torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': epoch_loss,
-        }, os.path.join(out_dir, 'checkpoints/checkpoint_{}.pt'.format(epoch)))
+        }, os.path.join(out_dir, 'checkpoints/checkpoint_{}.pt'.format(epoch)))'''
         dev_loss, auroc = test(model, dev_data, dump_test_preds, out_dir, epoch, step="end",
                                return_loss=True, class_weights=class_weights, strategy=strategy, section_segment=section_segment,
                                do_laplacian_augment=do_laplacian_augment, do_contrastive_loss=do_contrastive_loss,
@@ -1164,14 +1164,14 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
                 accumulation_steps, strategy, use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment, do_laplacian_augment, 
                 do_contrastive_loss=do_contrastive_loss, alpha=alpha, temperature=temperature, max_negatives=max_negatives, memory_bank_load_amount=memory_bank_load_amount)
         if do_test:
-            if checkpoint is not None:
+            if checkpoint is not None: # 如果训练中断，加载一个中间段的checkpoint
                 if 'checkpoint' in checkpoint:
                     full_checkpoint = torch.load(checkpoint)
                     model.load_state_dict(full_checkpoint['model_state_dict'])
-                else:
+                else: #如果直接load best_model
                     model.load_state_dict(torch.load(checkpoint))
                     print('Loaded checkpoint')
-            else:
+            else: # 训练结束后，直接加载best model
                 model.load_state_dict(torch.load(os.path.join(out_dir, 'best_model.pt')))
             
             test(model, test_batches, dump_test_preds, out_dir, epoch="end", step="test",

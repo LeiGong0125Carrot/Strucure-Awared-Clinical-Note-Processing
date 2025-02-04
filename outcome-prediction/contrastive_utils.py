@@ -66,24 +66,31 @@ def check_pairs_labels(anchor_features, positive_features, negative_features, an
 def construct_pairs(features, labels, memory_bank, n_negatives=4, device='cuda'):
     """
     构造对比学习的样本对，每个anchor对应一个positive和多个negative samples
+    
     Args:
         features: 当前batch的特征 [batch_size, feature_dim]
-        labels: 当前batch的标签
+        labels: 当前batch的标签列表
         memory_bank: 存储历史特征的memory bank
-        n_negatives: 每个anchor选择的负样本数量
+        n_negatives: 每个anchor需要的负样本数量
+        device: 计算设备 ('cuda' or 'cpu')
+    
     Returns:
-        anchors: [N, feature_dim]
-        positives: [N, feature_dim]
-        negatives: [N, n_negatives, feature_dim]  # 关键改动：增加一个维度
+        anchors: [N, feature_dim] - anchor样本特征
+        positives: [N, feature_dim] - positive样本特征
+        negatives: [N, n_negatives, feature_dim] - negative样本特征
+        anchor_labels: anchor样本的标签列表
+        pos_labels: positive样本的标签列表
+        neg_labels_groups: negative样本的标签列表组
     """
     anchors = []
     pos_features = []
-    neg_features_groups = []  # 存储每个anchor的多个negative samples
+    neg_features_groups = []
     anchor_labels = []
     pos_labels = []
     neg_labels_groups = []
     
-    for i, (feat, label) in enumerate(zip(features, labels)):
+    for feat, label in zip(features, labels):
+        # 从memory bank获取样本
         memory_feats, memory_labels = memory_bank.get_samples(
             current_labels=[label],
             exclude_labels=None
@@ -91,37 +98,52 @@ def construct_pairs(features, labels, memory_bank, n_negatives=4, device='cuda')
         
         if len(memory_feats) == 0:
             continue
-            
+        
+        # 找到所有可能的positive和negative样本索引
         pos_indices = [i for i, l in enumerate(memory_labels) if l == label]
         neg_indices = [i for i, l in enumerate(memory_labels) if l != label]
         
+        # 确保有足够的positive和negative样本
         if len(pos_indices) == 0 or len(neg_indices) < n_negatives:
             continue
         
-        # 为每个anchor选择一个positive
+        # 随机选择一个positive样本
         pos_idx = random.choice(pos_indices)
-        # 选择多个negatives
+        pos_label = memory_labels[pos_idx]
+        
+        # 更新negative_indices以排除与positive标签相同的样本
+        neg_indices = [i for i in neg_indices if memory_labels[i] != pos_label]
+        
+        # 如果没有足够的负样本，跳过这个anchor
+        if len(neg_indices) < n_negatives:
+            continue
+            
+        # 随机选择negative样本
         neg_idxs = random.sample(neg_indices, n_negatives)
         
-        # 收集样本
+        # 收集样本和标签
         anchors.append(feat.to(device))
         pos_features.append(memory_feats[pos_idx].to(device))
-        # 收集这个anchor的所有negative samples
+        
+        # 收集negative samples并确保维度正确
         curr_neg_features = [memory_feats[idx].to(device) for idx in neg_idxs]
         neg_features_groups.append(torch.stack(curr_neg_features))
         
         # 收集标签
         anchor_labels.append(label)
-        pos_labels.append(memory_labels[pos_idx])
+        pos_labels.append(pos_label)
         neg_labels_groups.append([memory_labels[idx] for idx in neg_idxs])
     
+    # 如果没有成功构造任何样本对，返回空tensor
     if not anchors:
-        return torch.empty(0,features.size(1)), torch.empty(0,features.size(1)), \
-               torch.empty(0,features.size(1),0), [], [], []
+        return (torch.empty(0, features.size(1)).to(device), 
+                torch.empty(0, features.size(1)).to(device),
+                torch.empty(0, features.size(1), 0).to(device),
+                [], [], [])
     
-    # 将列表转换为tensor，注意negative samples多一个维度
-    anchors = torch.stack(anchors)  # [N, feature_dim]
-    positives = torch.stack(pos_features)  # [N, feature_dim]
+    # 将列表转换为tensor
+    anchors = torch.stack(anchors)           # [N, feature_dim]
+    positives = torch.stack(pos_features)    # [N, feature_dim]
     negatives = torch.stack(neg_features_groups)  # [N, n_negatives, feature_dim]
     
     return (anchors, positives, negatives, 
@@ -134,7 +156,7 @@ class MemoryBank:
         self.momentum = momentum
         
         # 为每个类别维护独立的deque
-        self.features_per_class = {}  # Dict[label, deque]
+        self.features_per_class = {}  # Dict[label, torch.Tensor]
         self.class_counts = {}
         
         # 计算每个类别的最大样本数
@@ -144,43 +166,36 @@ class MemoryBank:
     def get_samples(self, current_labels: list, n_samples: Optional[int] = None, exclude_labels: list = None):
         if not self.features_per_class:
             return torch.empty(0, self.feature_dim), []
-            
-        # 收集所有可用样本
-        all_features = []
-        all_labels = []
-        
+                
         exclude_labels = exclude_labels or []
+        # 筛选可用类别
         available_classes = [label for label in self.features_per_class.keys() 
-                           if label not in exclude_labels]
+                        if label not in exclude_labels]
         
         if not available_classes:
             return torch.empty(0, self.feature_dim), []
             
-        # 从每个类别中收集样本
-        for label in available_classes:
-            features = list(self.features_per_class[label])
-            all_features.extend(features)
-            all_labels.extend([label] * len(features))
-            
-        # 转换为tensor
-        features_tensor = torch.tensor(all_features)
+        # 直接使用存储的 tensor
+        all_features = []
+        all_labels = []
         
-        # 如果需要限制样本数量
+        for label in available_classes:
+            features = self.features_per_class[label]
+            if isinstance(features, deque):
+                features = torch.tensor(list(features))
+            all_features.append(features)
+            all_labels.extend([label] * len(features))
+        
+        if not all_features:
+            return torch.empty(0, self.feature_dim), []
+            
+        features_tensor = torch.cat(all_features)
+        
         if n_samples is not None and len(features_tensor) > n_samples:
-            # 确保每个类别都有代表
-            samples_per_class = n_samples // len(available_classes)
-            selected_features = []
-            selected_labels = []
-            
-            for label in available_classes:
-                class_indices = [i for i, l in enumerate(all_labels) if l == label]
-                selected_indices = class_indices[:samples_per_class]
-                selected_features.append(features_tensor[selected_indices])
-                selected_labels.extend([label] * len(selected_indices))
-            
-            features_tensor = torch.cat(selected_features)
-            all_labels = selected_labels
-            
+            # 随机采样
+            indices = torch.randperm(len(features_tensor))[:n_samples]
+            return features_tensor[indices], [all_labels[i] for i in indices]
+        
         return features_tensor, all_labels
         
     def __len__(self) -> int:
@@ -196,16 +211,16 @@ class MemoryBank:
             
         return self.contrastive_loss_activated or sufficient
     
-    def update(self, features: torch.Tensor, labels: list, update_existing: bool = True):
+    def update(self, features: torch.Tensor, labels: list):
         features = features.detach().cpu()
-
+        
         for feat, label in zip(features, labels):
-            label_key = label.item() if isinstance(label, torch.Tensor) else label  # 转换tensor为普通数字
-
+            label_key = label.item() if isinstance(label, torch.Tensor) else label
+            
             if label_key not in self.features_per_class:
                 self.features_per_class[label_key] = deque(maxlen=self.samples_per_class)
                 self.class_counts[label_key] = 0
-
+            
             self.features_per_class[label_key].append(feat.tolist())
             self.class_counts[label_key] = len(self.features_per_class[label_key])
 
