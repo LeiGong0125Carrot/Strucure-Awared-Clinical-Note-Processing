@@ -27,7 +27,7 @@ from outcome_models import BertLongForSequenceClassification, LitAugPredictorBie
 from info_nce import InfoNCE, info_nce
 from contrastive_utils import tokenize_and_batch, main_training_loop, move_to_cuda, collate_fn, evaluate, MemoryBank, margin_orthogonal_loss, add_contrastive_loss
 import logging
-# os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4"
 
 # 配置logger
 logger = logging.getLogger(__name__)

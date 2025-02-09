@@ -24,6 +24,19 @@ def add_contrastive_loss(outputs, model, memory_bank, info_nce_loss, logger, ste
     ortho_loss = margin_orthogonal_loss(pos_features, neg_features)
     
     return contrastive_loss, adaptive_weight, ortho_loss
+def residual_independent_fusion_average(section_embeddings, g, alpha, lambda_residual=0.1):
+    """
+    section_embeddings: (batch, num_sections, embedding_dim)
+    g: (batch, num_sections, 1) 门控权重
+    alpha: (batch, num_sections, 1) 结构感知注意力
+    """
+    # 计算加权求和的全局表示
+    weighted_sum = (g * alpha * section_embeddings).sum(dim=1)  # (batch, embedding_dim)
+    # 用每个样本各个 section embedding 的均值作为残差
+    residual = lambda_residual * section_embeddings.mean(dim=1)  # (batch, embedding_dim)
+    final_embedding = weighted_sum + residual
+    return final_embedding
+
 
 def residual_independent_fusion(section_embeddings, g, alpha, lambda_residual=0.1):
     """

@@ -4,6 +4,7 @@ import os
 import pickle
 import copy
 import numpy as np
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -23,11 +24,11 @@ from transformers import AdamW, BertConfig, BertTokenizer, BertForSequenceClassi
         AutoTokenizer, AutoConfig, AutoModel, BertTokenizerFast, set_seed, get_linear_schedule_with_warmup
 from transformers.models.longformer.modeling_longformer import LongformerSelfAttention
 from outcome_models import BertLongForSequenceClassification, LitAugPredictorBienc, LitAugPredictorCrossenc, L2RLitAugPredictorBienc, \
-        FullStructureAwareMissingEmbeddingGenerator, OrthAwareMissingEmbeddingGenerator, SAAMissingEmbeddingGenerator
-from info_nce import InfoNCE, info_nce
-from contrastive_utils import tokenize_and_batch, main_training_loop, move_to_cuda, collate_fn, evaluate, MemoryBank, margin_orthogonal_loss, add_contrastive_loss
+        FullStructureAwareMissingEmbeddingGenerator, OrthAwareMissingEmbeddingGenerator, SAAMissingEmbeddingGenerator, MOEMissingEmbeddingGenerator
+# from info_nce import InfoNCE, info_nce
+# from contrastive_utils import tokenize_and_batch, main_training_loop, move_to_cuda, collate_fn, evaluate, MemoryBank, margin_orthogonal_loss, add_contrastive_loss
 import logging
-# os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 # 配置logger
 logger = logging.getLogger(__name__)
@@ -628,9 +629,9 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         do_train, do_test, checkpoint, attention_window, max_pos,
         batch_size, lr, epochs, seed, accumulation_steps, num_top_docs, strategy, enc_strategy,
         use_warmup, warmup_steps, stop_on_roc, dump_test_preds, use_pico, doc_embeds, l2r_top_docs,
-        outcome, retrieval_labels, query_proj, query_loss, num_head=0, section_segment=False,  
-        module_type='full', margin=0.1, orth_weight=0.1, reduced_dimension=256, lambda_residual=0.1, delta=0.1,
-        ssa_softmax_temp=1.0):
+        outcome, retrieval_labels, query_proj, query_loss, run_name, num_head=0, section_segment=False,  
+        module_type='full', orth_weight=0.1, reduced_dimension=256, lambda_residual=0.1, delta=0.1,
+        ssa_softmax_temp=1.0, num_experts=8, threshold=0.5, moe_mode='raw', k=3, top_experts_k=2):
 
     assert accumulation_steps % batch_size == 0, "accumulation_steps must be a multiple of batch_size"
     
@@ -644,6 +645,21 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
     print(f"Number of sections selected: {len(selected_sections)}")
         
 
+
+    # 构造 out_dir
+    if section_segment:
+        out_dir = os.path.join(
+            out_dir, f"{outcome}/{init_model}/{section_segment}/{module_type}/{orth_weight}/{reduced_dimension}/{lambda_residual}/{delta}/{ssa_softmax_temp}/{run_name}"
+        )
+    else:
+        if longmodel_dir is not None:
+            out_dir = os.path.join(
+                out_dir, f"{outcome}/{init_model}/long/{module_type}/{run_name}"
+            )
+        else:
+            out_dir = os.path.join(
+                out_dir, f"{outcome}/{init_model}/raw/{module_type}/{run_name}"
+            )
     if longmodel_dir is not None and not os.path.exists(longmodel_dir):
         os.makedirs(longmodel_dir)
     if not os.path.exists(out_dir):
@@ -651,6 +667,9 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
     checkpoint_dir = os.path.join(out_dir, 'checkpoints')
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
+    # 创建目录（如果不存在）
+
+
     
     seed_torch(seed)
     set_seed(seed)
@@ -783,12 +802,16 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
             print(f"Test Orhtogonal Only Performance")
             model = OrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections, 
                                                        reduced_dim=reduced_dimension, delta=delta)
-        else:
+        elif module_type == 'ssa':
             print(f"Test SAA Only Performance")
             model = SAAMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections,
                                                  reduced_dim=reduced_dimension, lambda_residual=lambda_residual,
                                                  ssa_softmax_temp=ssa_softmax_temp)
-
+        elif module_type == 'moe':
+            print(f"Test MOE only Performance")
+            model = MOEMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections, 
+                                                num_experts=num_experts, threshold=threshold,moe_mode=moe_mode, k=k, top_experts_k=top_experts_k)
+        
         # model = ContextAwareMissingEmbeddingGenerator(config=config, model=model,num_sections=len(selected_sections), la_alpha=la_alpha)
     else:
         if lit_ranks is not None and doc_embeds is None: # we're training with literature, and we don't use existing embeddings
@@ -1078,11 +1101,11 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, action='store', help='Path to checkpoint to load model weights from')
     parser.add_argument('--attention_window', type=int, action='store', default=512, help='Attention window size')
     parser.add_argument('--max_pos', type=int, action='store', default=4096, help='Maximum position embedding size')
-    parser.add_argument('--batch_size', type=int, action='store', default=4, help='Specify batch size')
+    parser.add_argument('--batch_size', type=int, action='store', default=12, help='Specify batch size')
     parser.add_argument('--lr', type=float, action='store', default=2e-5, help='Specify learning rate')
-    parser.add_argument('--epochs', type=int, action='store', default=20, help='Specify number of epochs')
+    parser.add_argument('--epochs', type=int, action='store', default=10, help='Specify number of epochs')
     parser.add_argument('--seed', type=int, action='store', default=0, help='Specify random seed')
-    parser.add_argument('--accumulation_steps', type=int, action='store', default=32, help='Specify number of steps for gradient accumulation')
+    parser.add_argument('--accumulation_steps', type=int, action='store', default=48, help='Specify number of steps for gradient accumulation')
     parser.add_argument('--num_top_docs', type=float, action='store', default=1, help='Number of top ranked abstracts from PubMed to include')
     parser.add_argument('--strategy', type=str, action='store', default='average', help='Strategy to use to combine literature with EHR')
     parser.add_argument('--enc_strategy', type=str, action='store', default='bienc', help='Encoding strategy to use for notes and articles (bienc/crossenc)')
@@ -1109,6 +1132,13 @@ if __name__ == '__main__':
     parser.add_argument('--reduced_dimension', type=int, action='store', default=256, help='reduced dimension')
     parser.add_argument('--lambda_residual', type=float, action='store', default=0.1, help='weight for residual connection')
     parser.add_argument('--ssa_softmax_temp', type=float, action='store', default=1, help='temperature of the ssa module temperature')
+    # moe hyperparameter
+    parser.add_argument('--num_experts', type=int, action='store', default=None, help='number of experts for MOE module')
+    parser.add_argument('--threshold', type=float, action='store', default=None, help='threshold to construct the graph')
+    # KNN moe hyperparameter
+    parser.add_argument('--moe_mode', type=str, action='store', default=None, help='moe mode')
+    parser.add_argument('--k', type=int, action='store', default=None, help='number of top similarity sections edge to be connected')
+    parser.add_argument('--top_experts_k', type=int, action='store', default=None, help="Number of experts to be chosen")
 
     # parser.add_argument('--do_train', action='store_true', default=False, help='Specify if training should be performed')
     args = parser.parse_args()
@@ -1116,16 +1146,28 @@ if __name__ == '__main__':
 
     # do_long = args.longmodel_dir is not None
     if args.longmodel_dir is not None:
-        module_type = 'base_long'
-    elif args.longmodel_dir is None and args.section_segment == True:
-        module_type = args.module_type
+        args.module_type = 'base_long'
+        args.delta = None
+        args.orth_weight = None
+        args.reduced_dimension = None
+        args.lambda_residual = None
+        args.ssa_softmax_temp = None
+        
     elif args.longmodel_dir is None and args.section_segment == False:
-        module_type = 'base'
+        args.module_type = 'base'
+        args.delta = None
+        args.orth_weight = None
+        args.reduced_dimension = None
+        args.lambda_residual = None
+        args.ssa_softmax_temp = None
+
+
+        
     wandb.init(
             project=f"Structure_Aware_Adm_{args.outcome}",  # 项目名称
             entity="nkw3mr-university-of-virginia",  # 你的 WandB 用户名或团队名
             config={
-                "module_type": module_type,
+                "module_type": args.module_type,
                 "section_segment": args.section_segment,
                 "model": args.init_model,
                 "do_long": args.longmodel_dir is not None,
@@ -1134,8 +1176,14 @@ if __name__ == '__main__':
                 'reduced_dimension': args.reduced_dimension,
                 'lambda_residual': args.lambda_residual,
                 "batch_size": args.batch_size,
-                "ssa_softmax_temp", args.ssa_softmax_temp
-
+                "ssa_softmax_temp": args.ssa_softmax_temp,
+                "run_name": args.run_name,
+                "accumulation_steps": args.accumulation_steps,
+                "num_experts": args.num_experts,
+                "threshold": args.threshold,
+                "k": args.k,
+                "moe_mode":args.moe_mode,
+                'top_experts_k':args.top_experts_k
             }
         )  # 直接同步所有超参数
 
@@ -1147,6 +1195,6 @@ if __name__ == '__main__':
         print(f"{key}: {value}")
 
     args_dict = vars(args)
-    args_dict.pop("run_name")
+    # args_dict.pop("run_name")
     run(**args_dict)
     wandb.finish()
