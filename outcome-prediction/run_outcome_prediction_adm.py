@@ -24,7 +24,7 @@ from transformers import AdamW, BertConfig, BertTokenizer, BertForSequenceClassi
         AutoTokenizer, AutoConfig, AutoModel, BertTokenizerFast, set_seed, get_linear_schedule_with_warmup
 from transformers.models.longformer.modeling_longformer import LongformerSelfAttention
 from outcome_models import BertLongForSequenceClassification, LitAugPredictorBienc, LitAugPredictorCrossenc, L2RLitAugPredictorBienc, \
-        FullStructureAwareMissingEmbeddingGenerator, OrthAwareMissingEmbeddingGenerator, SAAMissingEmbeddingGenerator, MOEMissingEmbeddingGenerator
+        OrthAwareMissingEmbeddingGenerator, MOEOrthAwareMissingEmbeddingGenerator
 # from info_nce import InfoNCE, info_nce
 # from contrastive_utils import tokenize_and_batch, main_training_loop, move_to_cuda, collate_fn, evaluate, MemoryBank, margin_orthogonal_loss, add_contrastive_loss
 import logging
@@ -630,8 +630,8 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         batch_size, lr, epochs, seed, accumulation_steps, num_top_docs, strategy, enc_strategy,
         use_warmup, warmup_steps, stop_on_roc, dump_test_preds, use_pico, doc_embeds, l2r_top_docs,
         outcome, retrieval_labels, query_proj, query_loss, run_name, num_head=0, section_segment=False,  
-        module_type='full', orth_weight=0.1, reduced_dimension=256, lambda_residual=0.1, delta=0.1,
-        ssa_softmax_temp=1.0, num_experts=8, threshold=0.5, moe_mode='raw', k=3, top_experts_k=2):
+        module_type='full', orth_weight=0.1, reduced_dimension=256, delta=0.1, num_experts=8, top_k=2,
+        do_dimension_reduction=True, ):
 
     assert accumulation_steps % batch_size == 0, "accumulation_steps must be a multiple of batch_size"
     
@@ -647,10 +647,15 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
 
 
     # 构造 out_dir
-    if section_segment:
-        out_dir = os.path.join(
-            out_dir, f"{outcome}/{init_model}/{section_segment}/{module_type}/{orth_weight}/{reduced_dimension}/{lambda_residual}/{delta}/{ssa_softmax_temp}/{run_name}"
-        )
+    if section_segment == True:
+        if module_type == 'orth':
+            out_dir = os.path.join(
+                out_dir, f"{outcome}/{init_model}/{section_segment}/{module_type}/{orth_weight}/{delta}/{reduced_dimension}/{run_name}"
+            )
+        else:
+            out_dir = os.path.join(
+                out_dir, f"{outcome}/{init_model}/{section_segment}/{module_type}/{orth_weight}/{delta}/{top_k}/{num_experts}/{run_name}"
+            )
     else:
         if longmodel_dir is not None:
             out_dir = os.path.join(
@@ -793,25 +798,18 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         # Step 4: use custom class to extend the base model
         print(f"Create Section-Based Model")
         num_sections = len(selected_sections)
-        if module_type == 'full':
-            print(f"Test Full Performance")
-            model = FullStructureAwareMissingEmbeddingGenerator(config=config,model=model, num_sections=num_sections, 
-                                                                reduced_dim=reduced_dimension, delta=delta, lambda_residual=lambda_residual,
-                                                                ssa_softmax_temp=ssa_softmax_temp)
-        elif module_type == 'orth':
+
+        if module_type == 'orth':
             print(f"Test Orhtogonal Only Performance")
             model = OrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections, 
-                                                       reduced_dim=reduced_dimension, delta=delta)
-        elif module_type == 'ssa':
-            print(f"Test SAA Only Performance")
-            model = SAAMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections,
-                                                 reduced_dim=reduced_dimension, lambda_residual=lambda_residual,
-                                                 ssa_softmax_temp=ssa_softmax_temp)
-        elif module_type == 'moe':
-            print(f"Test MOE only Performance")
-            model = MOEMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections, 
-                                                num_experts=num_experts, threshold=threshold,moe_mode=moe_mode, k=k, top_experts_k=top_experts_k)
-        
+                                                       reduced_dim=reduced_dimension, delta=delta,
+                                                       do_dimension_reduction=do_dimension_reduction)
+        elif module_type == 'moe_orth':
+            print(f"Test Moe Orthogonal Performance")
+            model = MOEOrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections,
+                                                          reduced_dim=reduced_dimension, delta=delta,
+                                                          do_dimension_reduction=do_dimension_reduction,
+                                                          num_experts=num_experts, top_k=top_k)
         # model = ContextAwareMissingEmbeddingGenerator(config=config, model=model,num_sections=len(selected_sections), la_alpha=la_alpha)
     else:
         if lit_ranks is not None and doc_embeds is None: # we're training with literature, and we don't use existing embeddings
@@ -1129,16 +1127,11 @@ if __name__ == '__main__':
     parser.add_argument('--module_type', type=str, action='store', default='base', help='module type')
     parser.add_argument('--delta', type=float, action='store', default=0.1, help='margin for orthogonal regulation')
     parser.add_argument('--orth_weight', type=float, action='store', default=0.1, help='weight of the orthogonal loss')
+    parser.add_argument('--do_dimension_reduction', action='store_true', default=False, help='decide if we use the dimension reduction')
     parser.add_argument('--reduced_dimension', type=int, action='store', default=256, help='reduced dimension')
-    parser.add_argument('--lambda_residual', type=float, action='store', default=0.1, help='weight for residual connection')
-    parser.add_argument('--ssa_softmax_temp', type=float, action='store', default=1, help='temperature of the ssa module temperature')
-    # moe hyperparameter
-    parser.add_argument('--num_experts', type=int, action='store', default=None, help='number of experts for MOE module')
-    parser.add_argument('--threshold', type=float, action='store', default=None, help='threshold to construct the graph')
+    parser.add_argument('--num_experts', type=int, action='store', default=0, help='number of experts for MOE module')
     # KNN moe hyperparameter
-    parser.add_argument('--moe_mode', type=str, action='store', default=None, help='moe mode')
-    parser.add_argument('--k', type=int, action='store', default=None, help='number of top similarity sections edge to be connected')
-    parser.add_argument('--top_experts_k', type=int, action='store', default=None, help="Number of experts to be chosen")
+    parser.add_argument('--top_k', type=int, action='store', default=0, help="Number of experts to be chosen")
 
     # parser.add_argument('--do_train', action='store_true', default=False, help='Specify if training should be performed')
     args = parser.parse_args()
@@ -1160,7 +1153,10 @@ if __name__ == '__main__':
         args.reduced_dimension = None
         args.lambda_residual = None
         args.ssa_softmax_temp = None
-
+        args.pooling_mode = None
+        
+    if not args.use_warmup:
+        args.warmup_steps = None
 
         
     wandb.init(
@@ -1174,16 +1170,15 @@ if __name__ == '__main__':
                 "margin": args.delta,
                 "orth_weight": args.orth_weight,
                 'reduced_dimension': args.reduced_dimension,
-                'lambda_residual': args.lambda_residual,
                 "batch_size": args.batch_size,
-                "ssa_softmax_temp": args.ssa_softmax_temp,
                 "run_name": args.run_name,
                 "accumulation_steps": args.accumulation_steps,
                 "num_experts": args.num_experts,
-                "threshold": args.threshold,
-                "k": args.k,
-                "moe_mode":args.moe_mode,
-                'top_experts_k':args.top_experts_k
+                'top_k':args.top_k,
+                'do_dimension_reduction':args.do_dimension_reduction,
+                'use_warmup': args.use_warmup,
+                'warmup_steps': args.warmup_steps,
+                'lr':args.lr,
             }
         )  # 直接同步所有超参数
 

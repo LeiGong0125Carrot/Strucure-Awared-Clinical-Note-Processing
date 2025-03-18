@@ -10,67 +10,10 @@ from transformers.models.longformer.modeling_longformer import LongformerSelfAtt
 import torch.nn.functional as F
 import contrastive_utils
 from contrastive_utils import construct_pairs, check_pairs_labels, margin_based_loss, residual_independent_fusion, residual_independent_fusion_average
-from torch_geometric.nn import GATConv
-from torch_geometric.data import Data
-
 section_names = [
             "past medical history", "chief complaint", "family history", "physical exam", "allergies", "social history",
         "medications on admission", "present illness"
         ]
-
-class BertWithContrastiveLearning(nn.Module):
-    def __init__(self, model, config):
-        super().__init__()
-        self.bert = model
-        # self.tokenizer = BertTokenizer.from_pretrained(model_name)
-        self.config = config
-    
-    def contrastive_forward(self, anchor_enc, positives_enc, negatives_enc):
-        anchor_emb = self.bert.bert(
-                    input_ids=anchor_enc['input_ids'], 
-                    attention_mask=anchor_enc['attention_mask'],
-                    token_type_ids=anchor_enc['token_type_ids'],
-                    position_ids=None,
-                    head_mask=None,
-                    inputs_embeds=None,
-                    output_attentions=None,
-                    output_hidden_states=None,
-                    return_dict=None
-                )
-        anchor_emb = anchor_emb.last_hidden_state[:, 0, :]
-        anchor_emb = anchor_emb.cuda()
-
-        pos_emb = self.bert.bert(
-                    input_ids=positives_enc['input_ids'], 
-                    attention_mask=positives_enc['attention_mask'],
-                    token_type_ids=positives_enc['token_type_ids'],
-                    position_ids=None,
-                    head_mask=None,
-                    inputs_embeds=None,
-                    output_attentions=None,
-                    output_hidden_states=None,
-                    return_dict=None
-                )
-        pos_emb = pos_emb.last_hidden_state[:, 0, :]
-        pos_emb = pos_emb.cuda()
-
-        neg_emb = self.bert.bert(
-                    input_ids=negatives_enc['input_ids'], 
-                    attention_mask=negatives_enc['attention_mask'],
-                    token_type_ids=negatives_enc['token_type_ids'],
-                    position_ids=None,
-                    head_mask=None,
-                    inputs_embeds=None,
-                    output_attentions=None,
-                    output_hidden_states=None,
-                    return_dict=None
-                )
-        neg_emb = neg_emb.last_hidden_state[:, 0, :]
-        neg_emb = neg_emb.cuda()
-
-        return anchor_emb, pos_emb, neg_emb
-
-
 class BertLongSelfAttention(LongformerSelfAttention):
 
     def forward(
@@ -104,77 +47,136 @@ class SectionDimReducer(nn.Module):
         x = self.act2(self.fc2(x))
         return self.layer_norm(x)
 
-class GatedSectionAggregation(nn.Module):
-    def __init__(self, embedding_dim):
-        super().__init__()
-        self.gate = nn.Linear(embedding_dim, 1)  # 计算 gate 权重
 
-    def forward(self, section_embeddings):
-        g = torch.sigmoid(self.gate(section_embeddings))  # (batch, num_sections, 1)
-        return g
+# 假设 FusionGatedExpertModule 如下定义
+class FusionGatedExpertModule(nn.Module):
+    def __init__(self, embed_dim, hidden_dim):
+        super(FusionGatedExpertModule, self).__init__()
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, embed_dim)
+        )
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        self.layernorm = nn.LayerNorm(embed_dim)
     
+    def forward(self, default_embed, context_embed):
+        # default_embed 和 context_embed 的形状均为 [batch_size, embed_dim]
+        fused_input = torch.cat([default_embed, context_embed], dim=-1)  # [batch_size, 2*embed_dim]
+        candidate = self.fusion_mlp(fused_input)  # [batch_size, embed_dim]
+        gate_value = self.gate_mlp(fused_input)   # [batch_size, 1]
+        output = gate_value * candidate + (1 - gate_value) * default_embed
+        output = self.layernorm(output)
+        return output, gate_value
 
-class StructureAwareAttention(nn.Module):
-    def __init__(self, embedding_dim,tau=1.0):
-        super().__init__()
-        self.W = nn.Parameter(torch.randn(embedding_dim, embedding_dim))
-        self.tau = tau
-
-    def forward(self, section_embeddings):
-        proj = torch.matmul(section_embeddings, self.W)
-        sim_matrix = torch.bmm(proj, section_embeddings.transpose(1, 2))
-        # alpha = torch.softmax(sim_matrix, dim=-1).sum(dim=2, keepdim=True)  # 归一化权重
-        alpha = torch.softmax(sim_matrix / self.tau, dim=-1).sum(dim=2, keepdim=True)  # 归一化权重
+# MultiExpertImputer 利用多个 FusionGatedExpertModule，并引入专家竞争（Top-K 路由器）
+class MultiExpertImputer(nn.Module):
+    def __init__(self, num_experts, embed_dim, hidden_dim, top_k=2):
+        super(MultiExpertImputer, self).__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.experts = nn.ModuleList([
+            FusionGatedExpertModule(embed_dim, hidden_dim) for _ in range(num_experts)
+        ])
+        # 路由器：输入为拼接的 default 与 context
+        self.router = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_experts)
+        )
+    
+    def forward(self, default_embed, context_embed):
+        """
+        :param default_embed: [batch_size, embed_dim]
+        :param context_embed: [batch_size, embed_dim]
+        :return: imputed embedding [batch_size, embed_dim] 和专家稀疏权重 [batch_size, num_experts]
+        """
+        batch_size = default_embed.size(0)
+        expert_outputs = []
+        for expert in self.experts:
+            out, _ = expert(default_embed, context_embed)
+            expert_outputs.append(out.unsqueeze(1))  # shape: [batch_size, 1, embed_dim]
+        expert_outputs = torch.cat(expert_outputs, dim=1)  # [batch_size, num_experts, embed_dim]
         
-        return alpha
+        # 路由器计算专家得分
+        router_input = torch.cat([default_embed, context_embed], dim=-1)  # [batch_size, 2*embed_dim]
+        scores = self.router(router_input)  # [batch_size, num_experts]
+        weights = F.softmax(scores, dim=-1)  # 归一化
+        
+        # 稀疏激活：仅保留 top_k 专家
+        topk_weights, topk_indices = torch.topk(weights, self.top_k, dim=-1)  # [batch_size, top_k]
+        batch_indices = torch.arange(batch_size, device=weights.device).unsqueeze(1)  # [batch_size, 1]
+        sparse_weights = torch.zeros_like(weights)  # [batch_size, num_experts]
+        sparse_weights[batch_indices, topk_indices] = topk_weights        
+        sparse_weights_expanded = sparse_weights.unsqueeze(-1)  # [batch_size, num_experts, 1]
 
-class FullStructureAwareMissingEmbeddingGenerator(nn.Module):
+        imputed_embed = (expert_outputs * sparse_weights_expanded).sum(dim=1)  # [batch_size, embed_dim]
+        return imputed_embed, sparse_weights
+
+
+class MOEOrthAwareMissingEmbeddingGenerator(nn.Module):
     def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, init_weight=0.5, reduced_dim=256, 
-                delta=0.1,lambda_residual=0.1, ssa_softmax_temp=1.0):
+                delta=0.1, num_experts=2, top_k=2, do_dimension_reduction=True):
         super().__init__()
         self.bert = model
         # self.tokenizer = BertTokenizer.from_pretrained(model_name)
         self.config = config
         self.input_size = self.config.hidden_size
-        self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
-        self.attention_layer = nn.MultiheadAttention(embed_dim=reduced_dim, num_heads=num_heads)
+        self.do_dimension_reduction = do_dimension_reduction
         self.output_size = config.num_labels
+        if do_dimension_reduction:
+            self.attention_layer = nn.MultiheadAttention(embed_dim=reduced_dim, num_heads=num_heads)
+            self.reducer = SectionDimReducer(orig_dim=embedding_dim, reduced_dim=reduced_dim) 
+            self.predictor = nn.Linear(reduced_dim, self.output_size)
+            
+        else:
+            self.attention_layer = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads)
+            self.predictor = nn.Linear(embedding_dim, self.output_size)
+
+        self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
         self.weight = nn.Parameter(torch.tensor(init_weight, dtype=torch.float32))
-        self.sigmoid = nn.Sigmoid()
-        self.reducer = SectionDimReducer(orig_dim=768, reduced_dim=reduced_dim)  # 先降维
-        self.gsa = GatedSectionAggregation(reduced_dim) 
-        self.saa = StructureAwareAttention(reduced_dim, tau=ssa_softmax_temp)
+
+        self.sigmoid = nn.Sigmoid()  # 先降维
         self.delta = delta
-        self.lambda_residual = lambda_residual
-        # self.bert_model = bert_model
-        # self.bert_config = bert_config
-        # self.topk = topk
-        # self.strategy = strategy
-        self.predictor = nn.Linear(reduced_dim, self.output_size)
         self.softmax = nn.Softmax(dim=1)
         self.device = self.missing_embeddings.weight.device
-        self.to(self.device)
 
         nn.init.xavier_uniform_(self.missing_embeddings.weight)
+
+        self.expert_imputer = MultiExpertImputer(num_experts=num_experts, embed_dim=embedding_dim, hidden_dim=reduced_dim, top_k=top_k)
+        self.to(self.device)
+        
+        
     def forward(self, batch):
         device = self.missing_embeddings.weight.device
         # print(batch.keys())
+        # print(f"Batch keys:  {batch.keys()}")
+
         batch_size = len(batch['ehr_id'])
         num_sections = len(batch['sections'].keys())
-
         section_names = list(batch['sections'].keys())
         batch['labels'] = batch['labels'].to(device)
         section_embeddings = torch.zeros((batch_size, num_sections, self.missing_embeddings.embedding_dim), device=device)
+        # print(f"Section embeddings shape: {section_embeddings.shape}")
         # print(f"Section Embedding shape: {section_embeddings.shape}")
         existing_vectors = torch.zeros((batch_size, num_sections), dtype=torch.float, device=device)
+        # print(f"Existing vectos shape: {existing_vectors.shape}")
         # print(f"Existing_vectors shape: {existing_vectors.shape}")
-
+        # print('-'*150)
         for idx, section_name in enumerate(section_names):
             section_data = batch['sections'][section_name]
             #print(section_data.keys())
             input_ids = section_data['input_ids']
             attention_mask = section_data['attention_mask']
             token_type_ids = section_data['token_type_ids']
+            # print(f"Input Ids shape: {input_ids.shape}")
+            # print(f"Attention mask shape: {attention_mask.shape}")
+            # print(f"Token type_ids shape: {token_type_ids.shape}")
             
             has_section = attention_mask.sum(dim=1) > 0
             # print(f"has_section: {has_section}")
@@ -207,105 +209,93 @@ class FullStructureAwareMissingEmbeddingGenerator(nn.Module):
                     # print(f"ehr_idx: {ehr_idx}")
                     section_embeddings[ehr_idx, idx, :] = cls_embeddings[idx_in_present]
                     existing_vectors[ehr_idx, idx] = 1  # 更新 existing_vectors
-
+            # print(f"Existing vectors: {existing_vectors}")
             missing_indices = torch.where(~has_section)[0].to(device)
             # print(f"Missing Indices: {missing_indices}")
             if len(missing_indices) > 0:
                 missing_embeddings = self.missing_embeddings(torch.tensor(idx).to(device))
+                # print(f"Default embeddings: {missing_embeddings}")
                 section_embeddings[missing_indices, idx, :] = missing_embeddings 
-            # print("-" * 120)
-        # print(f"Section Embedding shape: {section_embeddings.shape}")
-        # exit(0)
-        # print(f"Existing_vectors: {existing_vectors}")
-        # print(f"Initial Section Embeddings: {section_embeddings}'")
-        # print(f"Initial Section Embeddings shape: {section_embeddings.shape}")
-        section_embeddings = self.reducer(section_embeddings)
-        for ehr_idx in range(batch_size):
-            ehr_embeddings = section_embeddings[ehr_idx]
-            # print(f"EHR_Embeddings: {ehr_embeddings}")
-            # print(f"EHR_Embeddings shape: {ehr_embeddings.shape}")
-            ehr_existence_vector = existing_vectors[ehr_idx]
-            # print(f"EHR_existence_vector: {ehr_existence_vector}")
-            # print(f"EHR_existence_vector shape: {ehr_existence_vector.shape}")
-            exist_indices = ehr_existence_vector.bool()
 
-            if exist_indices.sum() == 0:
-                continue
-            # print(f"Exist_indices: {exist_indices}")
-            exist_section_embeddings = ehr_embeddings[exist_indices]
-            # print(f"Exist_section_embeddings: {exist_section_embeddings}")
-            
-            # print(f"Exist_section_embeddings shape: {exist_section_embeddings.shape}")
-            exist_section_embeddings = exist_section_embeddings.unsqueeze(1)  # [20, 1, 768]
-            # print(f"Adjusted exist_section_embeddings: {exist_section_embeddings.shape}")
 
-            missing_indices = torch.where(~exist_indices)[0]
-            updated_ehr_embeddings = []
-
-            for idx_in_ehr_embeddings, embedding in enumerate(ehr_embeddings):
-                if idx_in_ehr_embeddings in missing_indices:
-                    # Get the index within missing_indices
-                    idx_in_missing = (missing_indices == idx_in_ehr_embeddings).nonzero(as_tuple=True)[0].item()
-
-                    # Prepare missing_embedding
-                    missing_embedding = embedding.unsqueeze(0).unsqueeze(1)  # Shape: [1, 1, embedding_dim]
-
-                    # Compute attention output
-                    attn_output, _ = self.attention_layer(
-                        query=missing_embedding,
-                        key=exist_section_embeddings,
-                        value=exist_section_embeddings
-                    )
-
-                    # Update embedding (no in-place operation)
-                    updated_embedding = attn_output.squeeze(0).squeeze(0)
-                else:
-                    # Keep the original embedding
-                    updated_embedding = embedding
-
-                # Append to the list
-                updated_ehr_embeddings.append(updated_embedding)
-
-            # Stack the updated embeddings to form a tensor
-            ehr_embeddings = torch.stack(updated_ehr_embeddings, dim=0)  # Shape: [num_sections, embedding_dim]
-
-            # Assign back to section_embeddings without in-place modification
-            section_embeddings = section_embeddings.clone()
-            section_embeddings[ehr_idx] = ehr_embeddings
-        # print(f"Section Embedding Shape: {section_embeddings.shape}")
-        loss_orth = margin_based_loss(section_embeddings, delta=self.delta)
-        g = self.gsa(section_embeddings)  # 计算门控权重
-        # print(f"Gating weight: {g}")
-        alpha = self.saa(section_embeddings)  # 计算 SAA 权重
-        # print(f"SAA: {alpha}")
-        H_doc = residual_independent_fusion(section_embeddings, g, alpha, lambda_residual=self.lambda_residual)
-        # print(f"Final H_doc Shape:{H_doc.shape}")
-        # print(f"H_doc: {H_doc}")
+        mask = existing_vectors.to(device).unsqueeze(-1)  # [batch_size, num_sections, 1]
+        # 计算加权和并除以存在的 section 数量（避免除 0，加上 eps）
+        eps = 1e-8
+        context = (section_embeddings * mask).sum(dim=1) / (mask.sum(dim=1) + eps)  # [batch_size, embed_dim]
+        # 2. 构造所有 section 的默认嵌入
+        # 对于每个 section（按照固定顺序），通过 missing_embeddings 得到默认 embedding
+        default_all = self.missing_embeddings(torch.arange(num_sections, device=device))  # [num_sections, embed_dim]
+        # 扩展到 batch： [batch_size, num_sections, embed_dim]
+        default_all_exp = default_all.unsqueeze(0).expand(batch_size, -1, -1)
         
-        logits = self.predictor(H_doc)
+        # 3. 对于每个 sample、每个 section，我们希望对缺失位置进行 imputation
+        # 我们只更新缺失的位置（existing_mask == 0）
+        # 为了向量化处理，将 default_all_exp 和 context 扩展到 [batch_size, num_sections, embed_dim]
+        context_exp = context.unsqueeze(1).expand(-1, num_sections, -1)  # [batch_size, num_sections, embed_dim]
+        
+        # 将两个 tensor 拉平成 [batch_size * num_sections, embed_dim]
+        default_flat = default_all_exp.reshape(-1, self.missing_embeddings.embedding_dim)
+        context_flat = context_exp.reshape(-1, self.missing_embeddings.embedding_dim)
+        
+        # 4. 利用多专家 imputer 对所有位置进行 imputation（后续只选取缺失位置的结果）
+        imputed_flat, _ = self.expert_imputer(default_flat, context_flat)  # [batch_size * num_sections, embed_dim]
+        imputed_all = imputed_flat.reshape(batch_size, num_sections, self.missing_embeddings.embedding_dim)
+        
+        # 5. 更新 section_embeddings：对于缺失的位置（existing_mask == 0），替换为 imputed_all 的对应值
+        # 注意：existing_mask 是 1 表示存在，因此 (1 - existing_mask) 为缺失位置
+        existing_mask_float = existing_vectors.unsqueeze(-1).to(device)  # [batch_size, num_sections, 1]
+        section_embeddings = existing_mask_float * section_embeddings + (1 - existing_mask_float) * imputed_all
+        
+        # 后续：将更新后的 section_embeddings 输入到注意力层和 predictor 中进行下游任务预测
+        if self.do_dimension_reduction:
+            reduced_embeddings = self.reducer(section_embeddings)  # [batch_size, num_sections, reduced_dim]
+            attn_input = reduced_embeddings.transpose(0, 1)  # [num_sections, batch_size, reduced_dim]
+            attn_output, _ = self.attention_layer(attn_input, attn_input, attn_input)
+            global_embedding = attn_output.mean(dim=0)  # [batch_size, reduced_dim]
+            logits = self.predictor(global_embedding)
+        else:
+            attn_input = section_embeddings.transpose(0, 1)  # [num_sections, batch_size, embed_dim]
+            attn_output, _ = self.attention_layer(attn_input, attn_input, attn_input)
+            global_embedding = attn_output.mean(dim=0)  # [batch_size, embed_dim]
+            logits = self.predictor(global_embedding)
+
+        loss_orth = margin_based_loss(attn_output, delta=self.delta)
         return ((loss_orth, None), logits)
 
+
+        '''exit(0)
+        section_embeddings = self.process_missing_sections(section_embeddings, existing_vectors)
+        loss_orth = margin_based_loss(section_embeddings, delta=self.delta)
+        H_doc = section_embeddings.mean(dim=1)  # (batch_size, reduced_dim)
+        logits = self.predictor(H_doc)
+        return ((loss_orth, None), logits)'''
+
+    
+    
 class OrthAwareMissingEmbeddingGenerator(nn.Module):
     def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, init_weight=0.5, reduced_dim=256, 
-                delta=0.1):
+                delta=0.1, do_dimension_reduction=True):
         super().__init__()
         self.bert = model
         # self.tokenizer = BertTokenizer.from_pretrained(model_name)
         self.config = config
         self.input_size = self.config.hidden_size
-        self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
-        self.attention_layer = nn.MultiheadAttention(embed_dim=reduced_dim, num_heads=num_heads)
+        self.do_dimension_reduction = do_dimension_reduction
         self.output_size = config.num_labels
+        if do_dimension_reduction:
+            self.attention_layer = nn.MultiheadAttention(embed_dim=reduced_dim, num_heads=num_heads)
+            self.reducer = SectionDimReducer(orig_dim=embedding_dim, reduced_dim=reduced_dim) 
+            self.predictor = nn.Linear(reduced_dim, self.output_size)
+            
+        else:
+            self.attention_layer = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads)
+            self.predictor = nn.Linear(embedding_dim, self.output_size)
+
+        self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
         self.weight = nn.Parameter(torch.tensor(init_weight, dtype=torch.float32))
 
-        self.sigmoid = nn.Sigmoid()
-        self.reducer = SectionDimReducer(orig_dim=768, reduced_dim=reduced_dim)  # 先降维
+        self.sigmoid = nn.Sigmoid()  # 先降维
         self.delta = delta
-        # self.bert_model = bert_model
-        # self.bert_config = bert_config
-        # self.topk = topk
-        # self.strategy = strategy
-        self.predictor = nn.Linear(reduced_dim, self.output_size)
         self.softmax = nn.Softmax(dim=1)
         self.device = self.missing_embeddings.weight.device
         self.to(self.device)
@@ -314,21 +304,28 @@ class OrthAwareMissingEmbeddingGenerator(nn.Module):
     def forward(self, batch):
         device = self.missing_embeddings.weight.device
         # print(batch.keys())
+        # print(f"Batch keys:  {batch.keys()}")
+
         batch_size = len(batch['ehr_id'])
         num_sections = len(batch['sections'].keys())
         section_names = list(batch['sections'].keys())
         batch['labels'] = batch['labels'].to(device)
         section_embeddings = torch.zeros((batch_size, num_sections, self.missing_embeddings.embedding_dim), device=device)
+        # print(f"Section embeddings shape: {section_embeddings.shape}")
         # print(f"Section Embedding shape: {section_embeddings.shape}")
         existing_vectors = torch.zeros((batch_size, num_sections), dtype=torch.float, device=device)
+        # print(f"Existing vectos shape: {existing_vectors.shape}")
         # print(f"Existing_vectors shape: {existing_vectors.shape}")
-
+        # print('-'*150)
         for idx, section_name in enumerate(section_names):
             section_data = batch['sections'][section_name]
             #print(section_data.keys())
             input_ids = section_data['input_ids']
             attention_mask = section_data['attention_mask']
             token_type_ids = section_data['token_type_ids']
+            # print(f"Input Ids shape: {input_ids.shape}")
+            # print(f"Attention mask shape: {attention_mask.shape}")
+            # print(f"Token type_ids shape: {token_type_ids.shape}")
             
             has_section = attention_mask.sum(dim=1) > 0
             # print(f"has_section: {has_section}")
@@ -361,19 +358,26 @@ class OrthAwareMissingEmbeddingGenerator(nn.Module):
                     # print(f"ehr_idx: {ehr_idx}")
                     section_embeddings[ehr_idx, idx, :] = cls_embeddings[idx_in_present]
                     existing_vectors[ehr_idx, idx] = 1  # 更新 existing_vectors
-
+            # print(f"Existing vectors: {existing_vectors}")
             missing_indices = torch.where(~has_section)[0].to(device)
             # print(f"Missing Indices: {missing_indices}")
             if len(missing_indices) > 0:
                 missing_embeddings = self.missing_embeddings(torch.tensor(idx).to(device))
+                # print(f"Default embeddings: {missing_embeddings}")
                 section_embeddings[missing_indices, idx, :] = missing_embeddings 
+                # print(f"Processed missing embeddings shape: {missing_embeddings.shape}")
+            # print(f"Processed missing embeddings shape: {missing_embeddings.shape}")
+            # print(f"Processed section embeddings shape: {section_embeddings.shape}")
+            # print('-'*150)
+    
             # print("-" * 120)
         # print(f"Section Embedding shape: {section_embeddings.shape}")
         # exit(0)
         # print(f"Existing_vectors: {existing_vectors}")
         # print(f"Initial Section Embeddings: {section_embeddings}'")
         # print(f"Initial Section Embeddings shape: {section_embeddings.shape}")
-        section_embeddings = self.reducer(section_embeddings)
+        if self.do_dimension_reduction:
+            section_embeddings = self.reducer(section_embeddings)
         for ehr_idx in range(batch_size):
             ehr_embeddings = section_embeddings[ehr_idx]
             # print(f"EHR_Embeddings: {ehr_embeddings}")
@@ -431,502 +435,7 @@ class OrthAwareMissingEmbeddingGenerator(nn.Module):
         H_doc = section_embeddings.mean(dim=1)  # (batch_size, reduced_dim)
         logits = self.predictor(H_doc)
         return ((loss_orth, None), logits)
-
-class CrossAttentionPooling(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.query = nn.Parameter(torch.randn(1, 1, input_dim))  # 学习一个全局 Query
-        self.attn = nn.MultiheadAttention(embed_dim=input_dim, num_heads=8, batch_first=True)
-
-    def forward(self, section_embeddings):
-        batch_size = section_embeddings.shape[0]
-        query = self.query.expand(batch_size, -1, -1)  # 复制 Query
-        attn_output, attn_weights = self.attn(query, section_embeddings, section_embeddings)
-        doc_embedding = attn_output.squeeze(1)  # (batch_size, feature_dim)
-        return doc_embedding, attn_weights
-
-    
-class MoEModule(nn.Module):
-    def __init__(self, input_dim, output_dim, num_experts, num_sections, threshold=0.5):
-        super(MoEModule, self).__init__()
-        self.num_experts = num_experts
-        self.experts = nn.ModuleList([nn.Linear(input_dim, output_dim) for _ in range(num_experts)])
-        self.gating_network = nn.Linear(input_dim * 2, num_experts)
-        # self.device = device
-        # 初始化可学习的边权重
-        self.edge_weights = nn.Parameter(torch.randn(num_sections, num_sections))
-        self.conv = GATConv(input_dim, input_dim, edge_dim=1, add_self_loops=False)
-        self.threshold = torch.nn.Parameter(torch.tensor(threshold))
-
-    def forward(self, x):
-        batch_size, num_sections, _ = x.size()
-        # x = x.to(self.device)  # 确保 x 在 GPU
-        # print(f"Check data in moe: {x.shape}")  # (8, 256)
-
-        # **计算节点之间的 Cosine Similarity**
-        x_flat = x.view(num_sections, -1)  # (num_sections, feature_dim)
-        cos_sim = F.cosine_similarity(x_flat.unsqueeze(1), x_flat.unsqueeze(0), dim=-1)  # (num_sections, num_sections)
-
-        # **创建新的 edge_index**
-        edge_index = (cos_sim < self.threshold).nonzero(as_tuple=False).t()  # 只保留相似度低于 threshold 的边
-        # print(f"New edge index shape: {edge_index.shape}")  # 应该是 (2, num_edges)
-
-        # **计算新边的权重**
-        edge_attr = cos_sim[edge_index[0], edge_index[1]].unsqueeze(1)  # (num_edges, 1)
-
-        # **构建 Graph 数据**
-        x = x.view(-1, x.size(-1))  # (num_sections, feature_dim)
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-
-        # **GAT 计算聚合特征**
-        aggregated_features = self.conv(data.x, data.edge_index, data.edge_attr)
-        # print(f"aggregated feature dim in moe: {aggregated_features.shape}")  # (num_sections, feature_dim)
-
-        # **合并特征**
-        combined_features = torch.cat([x, aggregated_features], dim=-1)  # (num_sections, 2 * feature_dim)
-        # print(f"combined features dim in moe: {combined_features.shape}")  # (8, 512)
-
-        # **计算门控权重**
-        gating_weights = F.softmax(self.gating_network(combined_features), dim=-1)  # (num_sections, num_experts)
-        # print(f"Gating weights shape in moe: {gating_weights.shape}")  # (8, 8)
-
-        # **计算专家输出**
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=-1)  # (num_sections, feature_dim, num_experts)
-        expert_outputs = expert_outputs.permute(0, 2, 1)  # (num_sections, num_experts, feature_dim)
-        # print(f"Expert outputs dim in moe: {expert_outputs.shape}")  # (8, 8, 256)
-
-        # **专家加权求和**
-        output = torch.einsum('be,bec->bc', gating_weights, expert_outputs)  # (num_sections, feature_dim)
-        # print(f"sub final output shape in moe: {output.shape}")  # (8, 256)
-
-        # **恢复批次维度**
-        output = output.view(batch_size, num_sections, -1)
-        # print(f"final Output dimension in moe: {output.shape}")  # (1, 8, 256)
-
-        return output
-
-class KNNMoEModule(nn.Module):
-    def __init__(self, input_dim, output_dim, num_experts, k=3, top_experts_k=2, device='cuda'):
-        super(KNNMoEModule, self).__init__()
-        # self.device = torch.device(device)
-        self.num_experts = num_experts
-        self.k = k  # KNN 选择的最近邻数量
-        self.device = device
-        self.top_experts_k = top_experts_k
-
-        # ✅ 让 gating network 具有更好的区分能力（深度 MLP）
-        self.gating_network = nn.Sequential(
-            nn.Linear(input_dim * 2, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_experts)  # 输出 num_experts 维度的 gating 权重
-        )
-
-        # ✅ 定义 Experts（相同结构，但不同初始化）
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, output_dim),
-                nn.ReLU(),
-                nn.Linear(output_dim, output_dim)
-            ) for _ in range(num_experts)
-        ])
-        self.init_experts()  # 初始化不同的参数
-
-        # ✅ GAT 用于 KNN 传播信息
-        self.conv = GATConv(input_dim, input_dim, edge_dim=1, add_self_loops=False)
-
-    def init_experts(self):
-        """ 为每个 Expert 进行不同的参数初始化 """
-        for expert in self.experts:
-            for layer in expert:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)  # 使用 Xavier 初始化
-                    if layer.bias is not None:
-                        nn.init.zeros_(layer.bias)
-
-    def construct_knn_graph(self, x):
-        """ 使用 KNN 方式构建图结构，支持 batch 计算 """
-        batch_size, num_sections, _ = x.shape
-
-        # ✅ 计算 Cosine Similarity
-        cos_sim = F.cosine_similarity(x.unsqueeze(1), x.unsqueeze(2), dim=-1)  # (batch_size, num_sections, num_sections)
-        # print(f"cos sim in moe: {cos_sim}")
-        # print(f"cos sim shape in moe: {cos_sim.shape}")
-        # exit(0)
-
-        # ✅ 选取每个 section 最相似的 k 个 neighbors
-        values, indices = torch.topk(cos_sim, k=self.k, dim=-1, largest=True)  # (batch_size, num_sections, k)
-
-        # ✅ 生成 edge_index（确保 batch 维度正确）
-        row = torch.arange(num_sections).repeat(batch_size, self.k).flatten().to(self.device)  # (batch_size * num_sections * k)
-        col = indices.flatten()  # (batch_size * num_sections * k)
-        
-        # ✅ 生成 batch 维度信息，确保 batch 内部 sections 互不影响
-        batch_offset = torch.arange(batch_size,).repeat_interleave(num_sections * self.k) * num_sections
-        batch_offset = batch_offset.to(self.device)
-
-        col = col + batch_offset  # 确保 batch 内 sections 互不影响
-
-        # ✅ 组合 edge_index 和 edge_attr
-        edge_index = torch.stack([row, col], dim=0)  # (2, batch_size * num_edges_per_sample)
-        edge_attr = values.flatten().unsqueeze(1)  # (batch_size * num_edges_per_sample, 1)
-
-        return edge_index, edge_attr
-
-
-
-    def top_k_gating(self, gating_logits, k=2):
-        """ 让 gating network 只选择 Top-K 个 experts """
-        topk_values, topk_indices = torch.topk(gating_logits, k=k, dim=-1)  # 选择 Top-K 重要 experts
-        sparse_gating = torch.zeros_like(gating_logits).scatter(-1, topk_indices, topk_values)  # 只保留 Top-K
-        return F.softmax(sparse_gating, dim=-1)  # 归一化
-
-    def forward(self, x):
-        batch_size, num_sections, _ = x.size()
-        # x = x.to(self.device)
-
-        # ✅ Step 1: 用 KNN 方式构建 edge_index
-        edge_index, edge_attr = self.construct_knn_graph(x)
-        # print(f"Edge Index shape in moe: {edge_index.shape}")
-        # print(f"Edge Attr shape in moe: {edge_attr.shape}")
-
-        # ✅ Step 2: 进行 GAT 聚合
-        data = Data(x=x.view(-1, x.size(-1)), edge_index=edge_index, edge_attr=edge_attr)
-        aggregated_features = self.conv(data.x, data.edge_index, data.edge_attr)  # (batch_size * num_sections, feature_dim)
-
-        # ✅ 变回 batch 维度
-        aggregated_features = aggregated_features.view(batch_size, num_sections, -1)  # (batch_size, num_sections, feature_dim)
-
-        # print(f"Aggregated features shape in moe: {aggregated_features.shape}")
-
-        # ✅ Step 3: 计算 MoE gating 网络的输入
-        combined_features = torch.cat([x, aggregated_features], dim=-1)  # (num_sections, 2 * feature_dim)
-        # print(f"Combined Features shape in moe: {combined_features.shape}")
-
-        # ✅ Step 4: 计算 gating 权重，并使用 Top-K 选择策略
-        gating_logits = self.gating_network(combined_features)  # (batch_size, num_sections, num_experts)
-        # print(f"Gating logits shape in moe: {gating_logits.shape}")
-        gating_weights = self.top_k_gating(gating_logits, k=self.top_experts_k)  # 只选最重要的 experts
-        # print(f"Gating weigths shape in moe: {gating_weights.shape}")
-
-        # ✅ Step 5: 计算 experts 处理的 outputs
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=-1)  # (num_sections, feature_dim, num_experts)
-        expert_outputs = expert_outputs.permute(0, 1, 3, 2)  # (batch_size, num_sections, num_experts, feature_dim)
-        # print(f"Expert outputs shape in moe: {expert_outputs.shape}")
-
-        # ✅ Step 6: 让 gating 权重对 experts outputs 进行加权求和
-        section_embedding = torch.einsum('bne,bnef->bnf', gating_weights, expert_outputs)  # (num_sections, feature_dim)
-        # print(f"Final section embedding shape in moe: {section_embedding.shape}")
-        
-        return section_embedding  # 返回处理后的 section embeddings
-
-
-
-
-class MOEMissingEmbeddingGenerator(nn.Module):
-    def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, init_weight=0.5, reduced_dim=256,
-                 num_experts=8, threshold=0.5, moe_mode='raw', k=3, top_experts_k=2):
-        super().__init__()
-        self.bert = model
-        # self.tokenizer = BertTokenizer.from_pretrained(model_name)
-        self.config = config
-        self.input_size = self.config.hidden_size
-        self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
-        self.attention_layer = nn.MultiheadAttention(embed_dim=reduced_dim, num_heads=num_heads)
-        self.output_size = config.num_labels
-        self.weight = nn.Parameter(torch.tensor(init_weight, dtype=torch.float32))
-        self.sigmoid = nn.Sigmoid()
-        self.reducer = SectionDimReducer(orig_dim=768, reduced_dim=reduced_dim)  # 先降维
-        self.cross_attention_pooling = CrossAttentionPooling(input_dim=reduced_dim)
-        if moe_mode == 'raw':
-            self.moe = MoEModule(reduced_dim, reduced_dim, num_experts, num_sections, threshold=threshold)
-        elif moe_mode == 'knn':
-            self.moe = KNNMoEModule(reduced_dim, reduced_dim, num_experts, k=k, top_experts_k=top_experts_k)
-        # self.bert_model = bert_model
-        # self.bert_config = bert_config
-        # self.topk = topk
-        # self.strategy = strategy
-        self.predictor = nn.Linear(reduced_dim, self.output_size)
-        self.softmax = nn.Softmax(dim=1)
-        self.device = self.missing_embeddings.weight.device
-        self.to(self.device)
-
-        nn.init.xavier_uniform_(self.missing_embeddings.weight)
-
-    def forward(self, batch):
-        device = self.missing_embeddings.weight.device
-        # print(batch.keys())
-        batch_size = len(batch['ehr_id'])
-        num_sections = len(batch['sections'].keys())
-        section_names = list(batch['sections'].keys())
-        batch['labels'] = batch['labels'].to(device)
-        section_embeddings = torch.zeros((batch_size, num_sections, self.missing_embeddings.embedding_dim), device=device)
-        # print(f"Section Embedding shape: {section_embeddings.shape}")
-        existing_vectors = torch.zeros((batch_size, num_sections), dtype=torch.float, device=device)
-        # print(f"Existing_vectors shape: {existing_vectors.shape}")
-
-        for idx, section_name in enumerate(section_names):
-            section_data = batch['sections'][section_name]
-            #print(section_data.keys())
-            input_ids = section_data['input_ids']
-            attention_mask = section_data['attention_mask']
-            token_type_ids = section_data['token_type_ids']
-            
-            has_section = attention_mask.sum(dim=1) > 0
-            # print(f"has_section: {has_section}")
-
-            if has_section.any():
-                # print(f"Present Indices: {present_indices}")
-                present_indices = torch.where(has_section)[0].to(device)
-                # print(f"Present Indices: {present_indices}")
-                present_input_ids = input_ids[present_indices].to(device)
-                present_attention_mask = attention_mask[present_indices].to(device)
-                present_token_type_ids = token_type_ids[present_indices].to(device)
-
-                outputs = self.bert.bert(
-                    input_ids=present_input_ids, 
-                    attention_mask=present_attention_mask,
-                    token_type_ids=present_token_type_ids,
-                    position_ids=None,
-                    head_mask=None,
-                    inputs_embeds=None,
-                    output_attentions=None,
-                    output_hidden_states=None,
-                    return_dict=None
-                )
-                # 多线程处理来提速
-                cls_embeddings = outputs.last_hidden_state[:, 0, :]
-                cls_embeddings = cls_embeddings.to(device)
-                
-                for idx_in_present, ehr_idx in enumerate(present_indices):
-                    # print(f"idx in present: {idx_in_present}")
-                    # print(f"ehr_idx: {ehr_idx}")
-                    section_embeddings[ehr_idx, idx, :] = cls_embeddings[idx_in_present]
-                    existing_vectors[ehr_idx, idx] = 1  # 更新 existing_vectors
-
-            missing_indices = torch.where(~has_section)[0].to(device)
-            # print(f"Missing Indices: {missing_indices}")
-            if len(missing_indices) > 0:
-                missing_embeddings = self.missing_embeddings(torch.tensor(idx).to(device))
-                section_embeddings[missing_indices, idx, :] = missing_embeddings 
-            # print("-" * 120)
-        # print(f"Section Embedding shape: {section_embeddings.shape}")
-        # exit(0)
-        # print(f"Existing_vectors: {existing_vectors}")
-        # print(f"Initial Section Embeddings: {section_embeddings}'")
-        # print(f"Initial Section Embeddings shape: {section_embeddings.shape}")
-        section_embeddings = self.reducer(section_embeddings)
-        for ehr_idx in range(batch_size):
-            ehr_embeddings = section_embeddings[ehr_idx]
-            # print(f"EHR_Embeddings: {ehr_embeddings}")
-            # print(f"EHR_Embeddings shape: {ehr_embeddings.shape}")
-            ehr_existence_vector = existing_vectors[ehr_idx]
-            # print(f"EHR_existence_vector: {ehr_existence_vector}")
-            # print(f"EHR_existence_vector shape: {ehr_existence_vector.shape}")
-            exist_indices = ehr_existence_vector.bool()
-
-            if exist_indices.sum() == 0:
-                continue
-            # print(f"Exist_indices: {exist_indices}")
-            exist_section_embeddings = ehr_embeddings[exist_indices]
-            # print(f"Exist_section_embeddings: {exist_section_embeddings}")
-            
-            # print(f"Exist_section_embeddings shape: {exist_section_embeddings.shape}")
-            exist_section_embeddings = exist_section_embeddings.unsqueeze(1)  # [20, 1, 768]
-            # print(f"Adjusted exist_section_embeddings: {exist_section_embeddings.shape}")
-
-            missing_indices = torch.where(~exist_indices)[0]
-            updated_ehr_embeddings = []
-
-            for idx_in_ehr_embeddings, embedding in enumerate(ehr_embeddings):
-                if idx_in_ehr_embeddings in missing_indices:
-                    # Get the index within missing_indices
-                    idx_in_missing = (missing_indices == idx_in_ehr_embeddings).nonzero(as_tuple=True)[0].item()
-
-                    # Prepare missing_embedding
-                    missing_embedding = embedding.unsqueeze(0).unsqueeze(1)  # Shape: [1, 1, embedding_dim]
-
-                    # Compute attention output
-                    attn_output, _ = self.attention_layer(
-                        query=missing_embedding,
-                        key=exist_section_embeddings,
-                        value=exist_section_embeddings
-                    )
-
-                    # Update embedding (no in-place operation)
-                    updated_embedding = attn_output.squeeze(0).squeeze(0)
-                else:
-                    # Keep the original embedding
-                    updated_embedding = embedding
-
-                # Append to the list
-                updated_ehr_embeddings.append(updated_embedding)
-
-            # Stack the updated embeddings to form a tensor
-            ehr_embeddings = torch.stack(updated_ehr_embeddings, dim=0)  # Shape: [num_sections, embedding_dim]
-
-            # Assign back to section_embeddings without in-place modification
-            section_embeddings = section_embeddings.clone()
-            section_embeddings[ehr_idx] = ehr_embeddings
-        
-        # loss_orth = margin_based_loss(section_embeddings)
-        moe_embedding = self.moe(section_embeddings)
-        doc_embedding, attn_weights = self.cross_attention_pooling(moe_embedding)
-        logits = self.predictor(doc_embedding)
-        return ((None, None), logits)
-
-class SAAMissingEmbeddingGenerator(nn.Module):
-    def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, init_weight=0.5, reduced_dim=256,
-                lambda_residual=0.1, ssa_softmax_temp=1.0):
-        super().__init__()
-        self.bert = model
-        # self.tokenizer = BertTokenizer.from_pretrained(model_name)
-        self.config = config
-        self.input_size = self.config.hidden_size
-        self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
-        self.attention_layer = nn.MultiheadAttention(embed_dim=reduced_dim, num_heads=num_heads)
-        self.output_size = config.num_labels
-        self.weight = nn.Parameter(torch.tensor(init_weight, dtype=torch.float32))
-        self.sigmoid = nn.Sigmoid()
-        self.reducer = SectionDimReducer(orig_dim=768, reduced_dim=reduced_dim)  # 先降维
-        self.gsa = GatedSectionAggregation(reduced_dim) 
-        self.saa = StructureAwareAttention(reduced_dim, tau=ssa_softmax_temp)
-        self.lambda_residual = lambda_residual
-        # self.bert_model = bert_model
-        # self.bert_config = bert_config
-        # self.topk = topk
-        # self.strategy = strategy
-        self.predictor = nn.Linear(reduced_dim, self.output_size)
-        self.softmax = nn.Softmax(dim=1)
-        self.device = self.missing_embeddings.weight.device
-        self.to(self.device)
-
-        nn.init.xavier_uniform_(self.missing_embeddings.weight)
-
-    def forward(self, batch):
-        device = self.missing_embeddings.weight.device
-        # print(batch.keys())
-        batch_size = len(batch['ehr_id'])
-        num_sections = len(batch['sections'].keys())
-        section_names = list(batch['sections'].keys())
-        batch['labels'] = batch['labels'].to(device)
-        section_embeddings = torch.zeros((batch_size, num_sections, self.missing_embeddings.embedding_dim), device=device)
-        # print(f"Section Embedding shape: {section_embeddings.shape}")
-        existing_vectors = torch.zeros((batch_size, num_sections), dtype=torch.float, device=device)
-        # print(f"Existing_vectors shape: {existing_vectors.shape}")
-
-        for idx, section_name in enumerate(section_names):
-            section_data = batch['sections'][section_name]
-            #print(section_data.keys())
-            input_ids = section_data['input_ids']
-            attention_mask = section_data['attention_mask']
-            token_type_ids = section_data['token_type_ids']
-            
-            has_section = attention_mask.sum(dim=1) > 0
-            # print(f"has_section: {has_section}")
-
-            if has_section.any():
-                # print(f"Present Indices: {present_indices}")
-                present_indices = torch.where(has_section)[0].to(device)
-                # print(f"Present Indices: {present_indices}")
-                present_input_ids = input_ids[present_indices].to(device)
-                present_attention_mask = attention_mask[present_indices].to(device)
-                present_token_type_ids = token_type_ids[present_indices].to(device)
-
-                outputs = self.bert.bert(
-                    input_ids=present_input_ids, 
-                    attention_mask=present_attention_mask,
-                    token_type_ids=present_token_type_ids,
-                    position_ids=None,
-                    head_mask=None,
-                    inputs_embeds=None,
-                    output_attentions=None,
-                    output_hidden_states=None,
-                    return_dict=None
-                )
-                # 多线程处理来提速
-                cls_embeddings = outputs.last_hidden_state[:, 0, :]
-                cls_embeddings = cls_embeddings.to(device)
-                
-                for idx_in_present, ehr_idx in enumerate(present_indices):
-                    # print(f"idx in present: {idx_in_present}")
-                    # print(f"ehr_idx: {ehr_idx}")
-                    section_embeddings[ehr_idx, idx, :] = cls_embeddings[idx_in_present]
-                    existing_vectors[ehr_idx, idx] = 1  # 更新 existing_vectors
-
-            missing_indices = torch.where(~has_section)[0].to(device)
-            # print(f"Missing Indices: {missing_indices}")
-            if len(missing_indices) > 0:
-                missing_embeddings = self.missing_embeddings(torch.tensor(idx).to(device))
-                section_embeddings[missing_indices, idx, :] = missing_embeddings 
-            # print("-" * 120)
-        # print(f"Section Embedding shape: {section_embeddings.shape}")
-        # exit(0)
-        # print(f"Existing_vectors: {existing_vectors}")
-        # print(f"Initial Section Embeddings: {section_embeddings}'")
-        # print(f"Initial Section Embeddings shape: {section_embeddings.shape}")
-        section_embeddings = self.reducer(section_embeddings)
-        for ehr_idx in range(batch_size):
-            ehr_embeddings = section_embeddings[ehr_idx]
-            # print(f"EHR_Embeddings: {ehr_embeddings}")
-            # print(f"EHR_Embeddings shape: {ehr_embeddings.shape}")
-            ehr_existence_vector = existing_vectors[ehr_idx]
-            # print(f"EHR_existence_vector: {ehr_existence_vector}")
-            # print(f"EHR_existence_vector shape: {ehr_existence_vector.shape}")
-            exist_indices = ehr_existence_vector.bool()
-
-            if exist_indices.sum() == 0:
-                continue
-            # print(f"Exist_indices: {exist_indices}")
-            exist_section_embeddings = ehr_embeddings[exist_indices]
-            # print(f"Exist_section_embeddings: {exist_section_embeddings}")
-            
-            # print(f"Exist_section_embeddings shape: {exist_section_embeddings.shape}")
-            exist_section_embeddings = exist_section_embeddings.unsqueeze(1)  # [20, 1, 768]
-            # print(f"Adjusted exist_section_embeddings: {exist_section_embeddings.shape}")
-
-            missing_indices = torch.where(~exist_indices)[0]
-            updated_ehr_embeddings = []
-
-            for idx_in_ehr_embeddings, embedding in enumerate(ehr_embeddings):
-                if idx_in_ehr_embeddings in missing_indices:
-                    # Get the index within missing_indices
-                    idx_in_missing = (missing_indices == idx_in_ehr_embeddings).nonzero(as_tuple=True)[0].item()
-
-                    # Prepare missing_embedding
-                    missing_embedding = embedding.unsqueeze(0).unsqueeze(1)  # Shape: [1, 1, embedding_dim]
-
-                    # Compute attention output
-                    attn_output, _ = self.attention_layer(
-                        query=missing_embedding,
-                        key=exist_section_embeddings,
-                        value=exist_section_embeddings
-                    )
-
-                    # Update embedding (no in-place operation)
-                    updated_embedding = attn_output.squeeze(0).squeeze(0)
-                else:
-                    # Keep the original embedding
-                    updated_embedding = embedding
-
-                # Append to the list
-                updated_ehr_embeddings.append(updated_embedding)
-
-            # Stack the updated embeddings to form a tensor
-            ehr_embeddings = torch.stack(updated_ehr_embeddings, dim=0)  # Shape: [num_sections, embedding_dim]
-
-            # Assign back to section_embeddings without in-place modification
-            section_embeddings = section_embeddings.clone()
-            section_embeddings[ehr_idx] = ehr_embeddings
-        
-        # loss_orth = margin_based_loss(section_embeddings)
-        g = self.gsa(section_embeddings)  # 计算门控权重
-        alpha = self.saa(section_embeddings)  # 计算 SAA 权重
-        H_doc = residual_independent_fusion(section_embeddings, g, alpha, lambda_residual=self.lambda_residual)
-        logits = self.predictor(H_doc)
-        return ((None, None), logits)
-
+  
 
 class ContextAwareMissingEmbeddingGenerator(nn.Module):
     def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, la_alpha=0.3, init_weight=0.5):
