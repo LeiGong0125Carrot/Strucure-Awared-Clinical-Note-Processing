@@ -47,11 +47,631 @@ class SectionDimReducer(nn.Module):
         x = self.act2(self.fc2(x))
         return self.layer_norm(x)
 
+class SimpleGate(nn.Module):
+    def __init__(self, input_dim):
+        """
+        单层门控网络：
+          - 使用一个全连接层，
+          - Tanh 激活后乘以系数再加上偏置，
+          - 输出范围为 [0,1]，初始值接近 0.5。
+        """
+        super(SimpleGate, self).__init__()
+        self.fc = nn.Linear(input_dim, 1)
+        # 采用零初始化，使得线性层初始输出接近 0
+        nn.init.constant_(self.fc.weight, 0)
+        nn.init.constant_(self.fc.bias, 0)
+        
+    def forward(self, x):
+        """
+        x: Tensor, shape [..., input_dim]
+        输出：Tensor, shape [...]，范围在 [0,1]
+        公式：g = 0.5 + 0.5 * tanh(fc(x))
+        当 fc(x) 取 0 时，输出 0.5；当 fc(x) 取正值时，g 接近 1；取负值时接近 0。
+        """
+        gate = self.fc(x)
+        gate = torch.tanh(gate)  # 输出范围 [-1, 1]
+        gate = 0.5 + 0.5 * gate  # 映射到 [0,1]
+        return gate
+
+
+
+
+class GatedMultiHeadSectionAttentionImputer(nn.Module):
+    def __init__(self, embedding_dim, num_heads, d_k, num_sections):
+        super(GatedMultiHeadSectionAttentionImputer, self).__init__()
+        self.num_heads = num_heads
+        self.d_k = d_k
+        self.total_dim = num_heads * d_k
+        
+        self.query_layer = nn.Linear(embedding_dim, self.total_dim)
+        self.key_layer = nn.Linear(embedding_dim, self.total_dim)
+        self.value_layer = nn.Linear(embedding_dim, self.total_dim)
+        
+        # 多头共现偏置参数，形状为 [num_heads, num_sections, d_k]
+        self.section_cooc_bias = nn.Parameter(torch.randn(num_heads, num_sections, d_k))
+        
+        # 为每个头定义一个简化的门控网络
+        # 输入特征为拼接后的 query 与 key，即维度为 2*d_k
+        self.gate_nets = nn.ModuleList([
+            SimpleGate(2 * d_k) for _ in range(num_heads)
+        ])
+        
+
+    def forward(self, ehr_embeddings, exist_indices, missing_indices):
+        """
+        ehr_embeddings: Tensor, shape [num_sections, embedding_dim]
+        exist_indices: 1D Tensor，存在 section 的索引
+        missing_indices: 1D Tensor，缺失 section 的索引
+        
+        对缺失部分进行多头 attention imputation，门控网络对共现偏置进行动态加权。
+        """
+        if len(missing_indices) == 0 or len(exist_indices) == 0:
+            return ehr_embeddings
+
+        # 提取缺失和存在的部分
+        missing_emb = ehr_embeddings[missing_indices]   # [M, embedding_dim]
+        exist_emb = ehr_embeddings[exist_indices]         # [N_exist, embedding_dim]
+        M = missing_emb.size(0)
+        N_exist = exist_emb.size(0)
+        
+        # 计算多头 Q, K, V
+        q_missing = self.query_layer(missing_emb)  # [M, total_dim]
+        k_exist = self.key_layer(exist_emb)        # [N_exist, total_dim]
+        v_exist = self.value_layer(exist_emb)        # [N_exist, total_dim]
+        
+        # reshape 并转置，得到 [num_heads, M, d_k] 和 [num_heads, N_exist, d_k]
+        q_missing = q_missing.view(M, self.num_heads, self.d_k).transpose(0, 1)
+        k_exist = k_exist.view(N_exist, self.num_heads, self.d_k).transpose(0, 1)
+        v_exist = v_exist.view(N_exist, self.num_heads, self.d_k).transpose(0, 1)
+        
+        # 标准注意力得分： [num_heads, M, N_exist]
+        scores = torch.matmul(q_missing, k_exist.transpose(-2, -1)) / (self.d_k ** 0.5)
+        
+        # 提取多头共现偏置向量：
+        # 缺失部分：[num_heads, M, d_k]；存在部分：[num_heads, N_exist, d_k]
+        missing_bias = self.section_cooc_bias[:, missing_indices, :]
+        exist_bias = self.section_cooc_bias[:, exist_indices, :]
+        # 得到 bias_term: [num_heads, M, N_exist]
+        bias_term = torch.matmul(missing_bias, exist_bias.transpose(-2, -1))
+        
+        # 计算门控值，每个头独立计算：
+        gated_bias = []
+        for h in range(self.num_heads):
+            # 对应头的 query 和 key，形状分别为 [M, d_k] 和 [N_exist, d_k]
+            q_h = q_missing[h]  # [M, d_k]
+            k_h = k_exist[h]    # [N_exist, d_k]
+            # 构造拼接特征: 将每个 (missing, exist) 对进行拼接，结果形状 [M, N_exist, 2*d_k]
+            q_expanded = q_h.unsqueeze(1).expand(-1, N_exist, -1)
+            k_expanded = k_h.unsqueeze(0).expand(M, -1, -1)
+            concat_feat = torch.cat([q_expanded, k_expanded], dim=-1)  # [M, N_exist, 2*d_k]
+            # 将拼接特征展平为二维 [M*N_exist, 2*d_k] 输入到门控网络中
+            concat_feat_flat = concat_feat.view(-1, 2 * self.d_k)
+            gate_vals = self.gate_nets[h](concat_feat_flat)  # [M*N_exist, 1]，输出范围 [0,1]
+            gate_vals = gate_vals.view(M, N_exist)  # [M, N_exist]
+            gated_bias.append(gate_vals)
+        gated_bias = torch.stack(gated_bias, dim=0)  # [num_heads, M, N_exist]
+        
+        # 用门控值调节共现偏置项
+        scores = scores + gated_bias * bias_term
+        
+        # 计算多头注意力输出
+        attn_weights = F.softmax(scores, dim=-1)  # [num_heads, M, N_exist]
+        attn_output = torch.matmul(attn_weights, v_exist)  # [num_heads, M, d_k]
+        
+        # 合并各头输出：转置并拼接为 [M, total_dim]
+        attn_output = attn_output.transpose(0, 1).contiguous().view(M, self.total_dim)
+        
+        # 更新缺失部分的 embedding
+        updated_embeddings = ehr_embeddings.clone()
+        updated_embeddings[missing_indices] = attn_output
+        
+        return updated_embeddings
+
+
+class MultiHeadSectionAttentionImputer(nn.Module):
+    def __init__(self, embedding_dim, num_heads, d_k, num_sections):
+        """
+        Args:
+            embedding_dim: 输入 section embedding 的维度
+            num_heads: 多头注意力中的头数
+            d_k: 每个头的维度（通常 d_k = embedding_dim / num_heads）
+            num_sections: 每个样本中 section 的数量
+        """
+        super(MultiHeadSectionAttentionImputer, self).__init__()
+        self.num_heads = num_heads
+        print(f"Number of heads: {self.num_heads}")
+        self.d_k = d_k
+        self.total_dim = num_heads * d_k  # 总输出维度
+
+        # 投影到多头空间
+        self.query_layer = nn.Linear(embedding_dim, self.total_dim)
+        self.key_layer = nn.Linear(embedding_dim, self.total_dim)
+        self.value_layer = nn.Linear(embedding_dim, self.total_dim)
+        
+        # 多头共现偏置参数，形状为 [num_heads, num_sections, d_k]
+        self.section_cooc_bias = nn.Parameter(torch.randn(num_heads, num_sections, d_k))
+        
+
+    def forward(self, ehr_embeddings, exist_indices, missing_indices):
+        """
+        对单个样本中缺失的 section 进行多头注意力 imputation。
+        
+        Args:
+            ehr_embeddings: Tensor, shape [num_sections, embedding_dim]
+            exist_indices: 1D Tensor，存在 section 的索引
+            missing_indices: 1D Tensor，缺失 section 的索引
+        Returns:
+            更新后的 ehr_embeddings，缺失部分经过多头 attention imputation
+            ，shape: [num_sections, embedding_dim]
+        """
+        # 若不存在缺失或存在部分为空，直接返回原始 embeddings
+        if len(missing_indices) == 0 or len(exist_indices) == 0:
+            return ehr_embeddings
+
+        # 提取缺失和存在部分的 embedding
+        missing_emb = ehr_embeddings[missing_indices]   # [M, embedding_dim]
+        exist_emb = ehr_embeddings[exist_indices]         # [N_exist, embedding_dim]
+        M = missing_emb.size(0)
+        N_exist = exist_emb.size(0)
+        
+        # 计算多头 Q, K, V
+        q_missing = self.query_layer(missing_emb)  # [M, total_dim]
+        k_exist = self.key_layer(exist_emb)          # [N_exist, total_dim]
+        v_exist = self.value_layer(exist_emb)          # [N_exist, total_dim]
+        
+        # Reshape为 [M, num_heads, d_k] 和 [N_exist, num_heads, d_k]
+        q_missing = q_missing.view(M, self.num_heads, self.d_k)
+        k_exist = k_exist.view(N_exist, self.num_heads, self.d_k)
+        v_exist = v_exist.view(N_exist, self.num_heads, self.d_k)
+        
+        # Transpose到 [num_heads, M, d_k] 和 [num_heads, N_exist, d_k]
+        q_missing = q_missing.transpose(0, 1)  # [num_heads, M, d_k]
+        k_exist = k_exist.transpose(0, 1)      # [num_heads, N_exist, d_k]
+        v_exist = v_exist.transpose(0, 1)      # [num_heads, N_exist, d_k]
+        
+        # 计算多头注意力得分： [num_heads, M, N_exist]
+        scores = torch.matmul(q_missing, k_exist.transpose(-2, -1)) / math.sqrt(self.d_k)
+        
+        # 提取多头共现偏置向量
+        # 缺失部分： [num_heads, M, d_k]
+        missing_bias = self.section_cooc_bias[:, missing_indices, :]
+        # 存在部分： [num_heads, N_exist, d_k]
+        exist_bias = self.section_cooc_bias[:, exist_indices, :]
+        # 计算共现偏置内积，得到 [num_heads, M, N_exist]
+        bias_term = torch.matmul(missing_bias, exist_bias.transpose(-2, -1))
+        
+        # 将 bias_term 加入 scores
+        scores = scores + bias_term
+        
+        # 计算多头注意力权重
+        attn_weights = F.softmax(scores, dim=-1)  # [num_heads, M, N_exist]
+        # 得到各头的输出： [num_heads, M, d_k]
+        attn_output = torch.matmul(attn_weights, v_exist)
+        
+        # 合并多头输出：先转置为 [M, num_heads, d_k]，再 reshape 为 [M, total_dim]
+        attn_output = attn_output.transpose(0, 1).contiguous().view(M, self.total_dim)
+        
+        # 用更新后的缺失部分替换原始 embedding 中对应部分
+        updated_embeddings = ehr_embeddings.clone()
+        updated_embeddings[missing_indices] = attn_output
+        
+        return updated_embeddings
+
+    
+class SectionAttentionImputer(nn.Module):
+    def __init__(self, embedding_dim, d_k, num_sections):
+        """
+        Args:
+            embedding_dim: 输入 section embedding 的维度
+            d_k: 注意力机制中 query/key/value 的维度
+            num_sections: 每个样本中 section 的数量
+        """
+        super(SectionAttentionImputer, self).__init__()
+        self.query_layer = nn.Linear(embedding_dim, d_k)
+        self.key_layer = nn.Linear(embedding_dim, d_k)
+        self.value_layer = nn.Linear(embedding_dim, d_k)
+        # 可学习的共现偏置，每个 section 拥有一个偏置向量
+        self.section_cooc_bias = nn.Parameter(torch.randn(num_sections, d_k))
+        
+        nn.init.xavier_uniform_(self.section_cooc_bias)
+    
+    def forward(self, ehr_embeddings, exist_indices, missing_indices):
+        """
+        对单个样本中的缺失 section 进行 imputation
+
+        Args:
+            ehr_embeddings: Tensor, shape [num_sections, embedding_dim]
+            exist_indices: 1D Tensor, 存在 section 的索引
+            missing_indices: 1D Tensor, 缺失 section 的索引
+
+        Returns:
+            更新后的 ehr_embeddings, 缺失部分已 impute
+        """
+        if len(missing_indices) == 0 or len(exist_indices) == 0:
+            return ehr_embeddings
+
+        # 获取缺失部分和存在部分的 embedding
+        missing_emb = ehr_embeddings[missing_indices]        # [M, embedding_dim]
+        exist_emb = ehr_embeddings[exist_indices]              # [n_exist, embedding_dim]
+
+        # 计算 Q（缺失部分）、K 和 V（存在部分）
+        q_missing = self.query_layer(missing_emb).unsqueeze(1)   # [M, 1, d_k]
+        k_exist = self.key_layer(exist_emb).unsqueeze(0)         # [1, n_exist, d_k]
+        v_exist = self.value_layer(exist_emb).unsqueeze(0)         # [1, n_exist, d_k]
+
+        d_k = q_missing.size(-1)
+        scores = torch.matmul(q_missing, k_exist.transpose(-2, -1)) / math.sqrt(d_k)  # [M, 1, n_exist]
+
+        # 共现偏置计算
+        missing_bias_vecs = self.section_cooc_bias[missing_indices].unsqueeze(1)  # [M, 1, d_k]
+        present_bias_vecs = self.section_cooc_bias[exist_indices].unsqueeze(0)      # [1, n_exist, d_k]
+        bias_term = torch.matmul(missing_bias_vecs, present_bias_vecs.transpose(-2, -1))  # [M, 1, n_exist]
+
+        scores = scores + bias_term
+        attn_weights = F.softmax(scores, dim=-1)  # [M, 1, n_exist]
+        attn_output = torch.matmul(attn_weights, v_exist)  # [M, 1, d_k]
+        attn_output = attn_output.squeeze(1)  # [M, d_k]
+
+        updated_embeddings = ehr_embeddings.clone()
+        updated_embeddings[missing_indices] = attn_output
+
+        return updated_embeddings
+
+
+class SectionOrthAwareMissingEmbeddingGenerator(nn.Module):
+    def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, init_weight=0.5, 
+                 delta=0.1):
+        super().__init__()
+        self.bert = model
+        self.config = config
+        self.input_size = self.config.hidden_size
+        self.output_size = config.num_labels
+        # print(f"Number of heads: {num_heads}")
+
+        self.predictor = nn.Linear(embedding_dim, self.output_size)
+
+        self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
+        self.weight = nn.Parameter(torch.tensor(init_weight, dtype=torch.float32))
+        self.sigmoid = nn.Sigmoid()
+        self.delta = delta
+        self.softmax = nn.Softmax(dim=1)
+        self.device = self.missing_embeddings.weight.device
+
+        # 根据是否降维确定 imputer 输入维度
+        input_dim_for_imputer =  embedding_dim
+        # 这里采用多头 imputer，需要计算每个头的维度（例如：每头维度 = input_dim_for_imputer // num_heads）
+        head_dim = input_dim_for_imputer // num_heads
+        
+
+        # print(f"Do Multi-head")
+        self.imputer = MultiHeadSectionAttentionImputer(embedding_dim=input_dim_for_imputer,
+                                                        num_heads=num_heads,
+                                                        d_k=head_dim,
+                                                        num_sections=num_sections)
+        
+        self.to(self.device)
+        nn.init.xavier_uniform_(self.missing_embeddings.weight)
+
+    def forward(self, batch):
+        """
+        完整的 forward 方法，首先构造 section embeddings，
+        然后利用多头 imputer 模块基于样本内部的共现偏置对缺失的 section 进行 imputation，
+        最后聚合所有 section 得到文档级别的表示并预测。
+        """
+        device = self.missing_embeddings.weight.device
+        batch_size = len(batch['ehr_id'])
+        num_sections = len(batch['sections'].keys())
+        section_names = list(batch['sections'].keys())
+        batch['labels'] = batch['labels'].to(device)
+
+        # 初始化 section embeddings 和存在标记
+        section_embeddings = torch.zeros((batch_size, num_sections, self.missing_embeddings.embedding_dim), device=device)
+        existing_vectors = torch.zeros((batch_size, num_sections), dtype=torch.float, device=device)
+
+        # 构造每个 section 的初始 embedding（使用 BERT 或缺失默认 embedding）
+        for idx, section_name in enumerate(section_names):
+            section_data = batch['sections'][section_name]
+            input_ids = section_data['input_ids']
+            attention_mask = section_data['attention_mask']
+            token_type_ids = section_data['token_type_ids']
+
+            has_section = attention_mask.sum(dim=1) > 0
+
+            if has_section.any():
+                present_indices = torch.where(has_section)[0].to(device)
+                present_input_ids = input_ids[present_indices].to(device)
+                present_attention_mask = attention_mask[present_indices].to(device)
+                present_token_type_ids = token_type_ids[present_indices].to(device)
+
+                outputs = self.bert.bert(
+                    input_ids=present_input_ids,
+                    attention_mask=present_attention_mask,
+                    token_type_ids=present_token_type_ids,
+                    position_ids=None,
+                    head_mask=None,
+                    inputs_embeds=None,
+                    output_attentions=None,
+                    output_hidden_states=None,
+                    return_dict=None
+                )
+                cls_embeddings = outputs.last_hidden_state[:, 0, :]  # [n_present, embedding_dim]
+                cls_embeddings = cls_embeddings.to(device)
+
+                for idx_in_present, ehr_idx in enumerate(present_indices):
+                    section_embeddings[ehr_idx, idx, :] = cls_embeddings[idx_in_present]
+                    existing_vectors[ehr_idx, idx] = 1
+
+            missing_indices = torch.where(~has_section)[0].to(device)
+            if len(missing_indices) > 0:
+                # print(f"section_embeddings[missing_indices, idx, :] shape: {section_embeddings[missing_indices, idx, :].shape}")
+                # default_emb = self.missing_embeddings(torch.tensor(idx).to(device))
+                # print(f"default_emb shape: {default_emb.shape}")
+                # section_embeddings[missing_indices, idx, :] = default_emb
+                # print(f"section_embeddings[missing_indices, idx, :] shape: {section_embeddings[missing_indices, idx, :].shape}")
+                default_emb = self.missing_embeddings(torch.tensor(idx).to(device))  # shape: [768]
+                default_emb = default_emb.unsqueeze(0).expand(len(missing_indices), -1)  # shape: [num_missing, 768]
+                # print(f"default_emb shape: {default_emb.shape}")
+                section_embeddings[missing_indices, idx, :] = default_emb
+
+        # 利用多头 imputer 模块对每个样本缺失部分进行 imputation
+        updated_section_embeddings = section_embeddings.clone()
+        for ehr_idx in range(batch_size):
+            ehr_embeddings = section_embeddings[ehr_idx]  # [num_sections, input_dim_for_imputer]
+            ehr_existence_vector = existing_vectors[ehr_idx]
+            exist_indices = torch.where(ehr_existence_vector.bool())[0]
+            missing_indices = torch.where(~ehr_existence_vector.bool())[0]
+
+            updated_ehr_embeddings = self.imputer(ehr_embeddings, exist_indices, missing_indices)
+            updated_section_embeddings[ehr_idx] = updated_ehr_embeddings
+
+        H_doc = section_embeddings.mean(dim=1)  # (batch_size, reduced_dim or embedding_dim)
+        logits = self.predictor(H_doc)
+
+        if self.delta > 0.0:
+            loss_orth = margin_based_loss(updated_section_embeddings, delta=self.delta)
+            return ((loss_orth, None), logits)
+        
+        return ((0, None), logits)
+
+
+class FiLMModule(nn.Module):
+    def __init__(self, condition_dim, feature_dim):
+        super(FiLMModule, self).__init__()
+        # 从条件向量生成缩放因子和平移因子
+        self.fc_gamma = nn.Linear(condition_dim, feature_dim)
+        self.fc_beta = nn.Linear(condition_dim, feature_dim)
+    
+    def forward(self, features, condition):
+        # features: [batch_size, feature_dim]
+        # condition: [batch_size, condition_dim]
+        gamma = self.fc_gamma(condition)  # [batch_size, feature_dim]
+        beta = self.fc_beta(condition)    # [batch_size, feature_dim]
+        # FiLM 调制
+        modulated = gamma * features + beta
+        return modulated
+    
+class CooccurrenceImputationModule(nn.Module):
+    def __init__(self, embedding_dim, condition_dim):
+        super(CooccurrenceImputationModule, self).__init__()
+        # 初步 imputation 模块
+        self.initial_imputer = nn.Linear(embedding_dim, embedding_dim)
+        # 将共现向量映射到条件向量的 MLP
+        self.condition_fc = nn.Sequential(
+            nn.Linear(8, condition_dim),  # 假设共现向量长度为 8
+            nn.ReLU(),
+            nn.Linear(condition_dim, condition_dim)
+        )
+        # FiLM 模块用于条件归一化
+        self.film = FiLMModule(condition_dim, embedding_dim)
+        # 新增：门控全连接层，用于计算融合权重
+        self.gate_fc = nn.Linear(embedding_dim * 2, 1)
+        self.layernorm = nn.LayerNorm(embedding_dim)
+    
+    def forward(self, context_embed, default_embed, cooccur_vector):
+        """
+        context_embed: [batch_size, embedding_dim]，通过存在 section 聚合得到的上下文 embedding
+        default_embed: [batch_size, embedding_dim]，当前缺失 section 的默认 embedding（从 self.missing_embeddings 得到）
+        cooccur_vector: [batch_size, 8]，每个 sample 的共现向量（0/1 表示各 section 的存在情况）
+        """
+        # 生成初步的 imputed embedding 基于上下文
+        imputed_initial = self.initial_imputer(context_embed)  # [batch_size, embedding_dim]
+        
+        # 将共现向量映射为条件向量
+        condition = self.condition_fc(cooccur_vector.float())  # [batch_size, condition_dim]
+        
+        # 使用 FiLM 对初步 imputed embedding 进行调制
+        film_output = self.film(imputed_initial, condition)  # [batch_size, embedding_dim]
+        
+        # 计算 gating 权重
+        # 拼接 default_embed 和 film_output
+        concat_feat = torch.cat([default_embed, film_output], dim=-1)  # [batch_size, embedding_dim*2]
+        gate = torch.sigmoid(self.gate_fc(concat_feat))  # [batch_size, 1]，范围在 0～1
+        
+        # 使用残差连接与 gating 融合：默认 embedding + gate * (FiLM 输出)
+        imputed_final = self.layernorm(default_embed + gate * film_output)  # [batch_size, embedding_dim]
+        
+        return imputed_final
+    
+class FiLMOrthAwareMissingEmbeddingGenerator(nn.Module):
+    def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, init_weight=0.5, 
+                 reduced_dim=256, delta=0.1,do_dimension_reduction=True, condition_dim=128):
+        super().__init__()
+        self.bert = model
+        self.config = config
+        self.input_size = self.config.hidden_size
+        self.do_dimension_reduction = do_dimension_reduction
+        self.output_size = config.num_labels
+        if do_dimension_reduction:
+            self.attention_layer = nn.MultiheadAttention(embed_dim=reduced_dim, num_heads=num_heads)
+            self.reducer = SectionDimReducer(orig_dim=embedding_dim, reduced_dim=reduced_dim) 
+            self.predictor = nn.Linear(reduced_dim, self.output_size)
+        else:
+            self.attention_layer = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads)
+            self.predictor = nn.Linear(embedding_dim, self.output_size)
+
+        self.missing_embeddings = nn.Embedding(num_sections, embedding_dim)
+        self.weight = nn.Parameter(torch.tensor(init_weight, dtype=torch.float32))
+        self.sigmoid = nn.Sigmoid()
+        self.delta = delta
+        self.softmax = nn.Softmax(dim=1)
+        self.device = self.missing_embeddings.weight.device
+        nn.init.xavier_uniform_(self.missing_embeddings.weight)
+
+        # 新的共现信息 imputation 模块
+        self.coocc_imputer = CooccurrenceImputationModule(embedding_dim, condition_dim)
+        
+        self.to(self.device)
+        
+        
+    def forward(self, batch):
+        device = self.missing_embeddings.weight.device
+        batch_size = len(batch['ehr_id'])
+        num_sections = len(batch['sections'].keys())
+        section_names = list(batch['sections'].keys())
+        batch['labels'] = batch['labels'].to(device)
+        section_embeddings = torch.zeros((batch_size, num_sections, self.missing_embeddings.embedding_dim), device=device)
+        existing_vectors = torch.zeros((batch_size, num_sections), dtype=torch.float, device=device)
+        
+        for idx, section_name in enumerate(section_names):
+            section_data = batch['sections'][section_name]
+            input_ids = section_data['input_ids']
+            attention_mask = section_data['attention_mask']
+            token_type_ids = section_data['token_type_ids']
+            
+            has_section = attention_mask.sum(dim=1) > 0
+            if has_section.any():
+                present_indices = torch.where(has_section)[0].to(device)
+                present_input_ids = input_ids[present_indices].to(device)
+                present_attention_mask = attention_mask[present_indices].to(device)
+                present_token_type_ids = token_type_ids[present_indices].to(device)
+
+                outputs = self.bert.bert(
+                    input_ids=present_input_ids, 
+                    attention_mask=present_attention_mask,
+                    token_type_ids=present_token_type_ids,
+                    position_ids=None,
+                    head_mask=None,
+                    inputs_embeds=None,
+                    output_attentions=None,
+                    output_hidden_states=None,
+                    return_dict=None
+                )
+                cls_embeddings = outputs.last_hidden_state[:, 0, :].to(device)
+                
+                for idx_in_present, ehr_idx in enumerate(present_indices):
+                    section_embeddings[ehr_idx, idx, :] = cls_embeddings[idx_in_present]
+                    existing_vectors[ehr_idx, idx] = 1
+                    
+            missing_indices = torch.where(~has_section)[0].to(device)
+            if len(missing_indices) > 0:
+                # 获取当前 section 的默认 embedding
+                default_emb = self.missing_embeddings(torch.tensor(idx, device=device))  # [embedding_dim]
+                # 直接赋值给缺失样本（后续会使用 cooccurrence imputation 进一步修正）
+                section_embeddings[missing_indices, idx, :] = default_emb
+
+        # 计算每个样本的存在性向量（共现向量），形状 [batch_size, num_sections]
+        # 这里 existing_vectors 即为每个样本的共现信息向量
+        # 假设 section_embeddings: [batch_size, num_sections, embedding_dim]
+        # existing_vectors: [batch_size, num_sections]，1 表示存在，0 表示缺失
+        eps = 1e-8
+        mask = existing_vectors.unsqueeze(-1)  # [batch_size, num_sections, 1]
+        # print(f"Mask dimension: {mask.shape}")
+        # print(f"Mask: {mask}")
+        context = (section_embeddings * mask).sum(dim=1) / (mask.sum(dim=1) + eps)  # [batch_size, embedding_dim]
+
+        # 构造默认 embedding
+        default_all = self.missing_embeddings(torch.arange(num_sections, device=device))  # [num_sections, embedding_dim]
+        default_all_exp = default_all.unsqueeze(0).expand(batch_size, -1, -1)  # [batch_size, num_sections, embedding_dim]
+
+        # 扩展上下文
+        context_exp = context.unsqueeze(1).expand(-1, num_sections, -1)  # [batch_size, num_sections, embedding_dim]
+
+        # 准备条件信息，这里直接用 existing_vectors, 如有需要可用 MLP 转换
+        condition = existing_vectors.float()  # [batch_size, 8]
+        condition_exp = condition.unsqueeze(1).expand(-1, num_sections, -1)  # [batch_size, num_sections, 8]
+        context_flat = context_exp.reshape(-1, self.missing_embeddings.embedding_dim)
+        default_flat = default_all_exp.reshape(-1, self.missing_embeddings.embedding_dim)
+        condition_flat = condition_exp.reshape(-1, condition.shape[-1])  # [batch_size*num_sections, 8]
+
+        # 调用新的共现信息 imputation 模块（基于 FiLM 的设计）
+        imputed_flat = self.coocc_imputer(context_flat, default_flat, condition_flat)  # 输出 [batch_size*num_sections, embedding_dim]
+        # print(f"Imputed flat shape: {imputed_flat.shape}")
+        # print(f"Imputed flat: {imputed_flat}")
+        imputed_all = imputed_flat.reshape(batch_size, num_sections, self.missing_embeddings.embedding_dim)
+
+        # 更新 section_embeddings：仅用 imputed embedding 替换缺失部分
+        existing_mask = existing_vectors.unsqueeze(-1)  # [batch_size, num_sections, 1]
+        section_embeddings = existing_mask * section_embeddings + (1 - existing_mask) * imputed_all
+
+        if self.do_dimension_reduction:
+            reduced_embeddings = self.reducer(section_embeddings)
+            attn_input = reduced_embeddings.transpose(0, 1)
+            attn_output, _ = self.attention_layer(attn_input, attn_input, attn_input)
+            global_embedding = attn_output.mean(dim=0)
+            logits = self.predictor(global_embedding)
+        else:
+            attn_input = section_embeddings.transpose(0, 1)
+            attn_output, _ = self.attention_layer(attn_input, attn_input, attn_input)
+            global_embedding = attn_output.mean(dim=0)
+            logits = self.predictor(global_embedding)
+        
+        loss_orth = margin_based_loss(attn_output, delta=self.delta)
+        # print(f"Orth Loss: {loss_orth}")
+        # print(f"Logits: {logits}")
+        # exit(0)
+        return ((loss_orth, None), logits)
+
+
+
+
+
+class DeepPositionEncoder(nn.Module):
+    def __init__(self, embedding_dim, hidden_dim, num_layers=3, dropout=0.1):
+        """
+        :param embedding_dim: 输入和输出的维度
+        :param hidden_dim: 隐藏层的维度
+        :param num_layers: 全连接层数
+        :param dropout: Dropout 概率
+        """
+        super(DeepPositionEncoder, self).__init__()
+        layers = []
+        input_dim = embedding_dim
+        for i in range(num_layers):
+            # 每层线性变换后接 ReLU 和 Dropout
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            # 后续层的输入维度设为 hidden_dim
+            input_dim = hidden_dim
+        # 最后一层映射回 embedding_dim
+        self.mlp = nn.Sequential(
+            *layers,
+            nn.Linear(hidden_dim, embedding_dim)
+        )
+        self.layernorm = nn.LayerNorm(embedding_dim)
+    
+    def forward(self, default_embed):
+        """
+        :param default_embed: 原始 default embedding, shape [batch_size, embedding_dim]
+        :return: 转换后的位置信息表示, shape [batch_size, embedding_dim]
+        """
+        # MLP 部分，深层非线性变换
+        transformed = self.mlp(default_embed)
+        # 残差连接：加上原始输入（如果你希望保留部分原始信息的话）
+        output = transformed + default_embed
+        # LayerNorm 归一化
+        output = self.layernorm(output)
+        return output
+
 
 # 假设 FusionGatedExpertModule 如下定义
 class FusionGatedExpertModule(nn.Module):
-    def __init__(self, embed_dim, hidden_dim):
+    def __init__(self, embed_dim, hidden_dim,num_layers=3, dropout=0.1):
         super(FusionGatedExpertModule, self).__init__()
+        # self.position_encoder = nn.Linear(embed_dim, embed_dim)
+        self.deep_position_encoder = DeepPositionEncoder(embed_dim, hidden_dim, num_layers, dropout)
+        
+        
         self.fusion_mlp = nn.Sequential(
             nn.Linear(embed_dim * 2, hidden_dim),
             nn.ReLU(),
@@ -66,22 +686,36 @@ class FusionGatedExpertModule(nn.Module):
         self.layernorm = nn.LayerNorm(embed_dim)
     
     def forward(self, default_embed, context_embed):
-        # default_embed 和 context_embed 的形状均为 [batch_size, embed_dim]
-        fused_input = torch.cat([default_embed, context_embed], dim=-1)  # [batch_size, 2*embed_dim]
+        """
+        :param default_embed: 缺失 section 的原始 default embedding, shape [batch_size, embed_dim]
+        :param context_embed: 上下文信息, shape [batch_size, embed_dim]
+        :return: imputed embedding, 以及门控值
+        """
+        # 将 default embedding 通过深层非线性变换转换为位置信息
+        pos_encoding = self.deep_position_encoder(default_embed)  # [batch_size, embed_dim]
+        
+        # 拼接上下文信息和位置信息
+        fused_input = torch.cat([context_embed, pos_encoding], dim=-1)  # [batch_size, 2*embed_dim]
+        
+        # 通过融合网络生成候选 imputed embedding
         candidate = self.fusion_mlp(fused_input)  # [batch_size, embed_dim]
+        
+        # 计算门控值，决定候选和上下文融合的比例
         gate_value = self.gate_mlp(fused_input)   # [batch_size, 1]
-        output = gate_value * candidate + (1 - gate_value) * default_embed
+        
+        # 最终融合：主要依赖上下文信息，同时候选表示也起补充作用
+        output = gate_value * candidate + (1 - gate_value) * context_embed
         output = self.layernorm(output)
         return output, gate_value
 
 # MultiExpertImputer 利用多个 FusionGatedExpertModule，并引入专家竞争（Top-K 路由器）
 class MultiExpertImputer(nn.Module):
-    def __init__(self, num_experts, embed_dim, hidden_dim, top_k=2):
+    def __init__(self, num_experts, embed_dim, hidden_dim, top_k=2, num_layers=3, dropout=0.1):
         super(MultiExpertImputer, self).__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.experts = nn.ModuleList([
-            FusionGatedExpertModule(embed_dim, hidden_dim) for _ in range(num_experts)
+            FusionGatedExpertModule(embed_dim, hidden_dim, num_layers=num_layers, dropout=dropout) for _ in range(num_experts)
         ])
         # 路由器：输入为拼接的 default 与 context
         self.router = nn.Sequential(
@@ -97,19 +731,23 @@ class MultiExpertImputer(nn.Module):
         :return: imputed embedding [batch_size, embed_dim] 和专家稀疏权重 [batch_size, num_experts]
         """
         batch_size = default_embed.size(0)
+        # print(f"Batch size in expert: {batch_size}")
         expert_outputs = []
         for expert in self.experts:
             out, _ = expert(default_embed, context_embed)
             expert_outputs.append(out.unsqueeze(1))  # shape: [batch_size, 1, embed_dim]
         expert_outputs = torch.cat(expert_outputs, dim=1)  # [batch_size, num_experts, embed_dim]
-        
+        # print(f"Shape of expert output: {expert_outputs.shape}")
         # 路由器计算专家得分
         router_input = torch.cat([default_embed, context_embed], dim=-1)  # [batch_size, 2*embed_dim]
+        # print(f"Shape of router input in expert: {router_input.shape}")
         scores = self.router(router_input)  # [batch_size, num_experts]
+        # print(f"Scores: {scores}")
         weights = F.softmax(scores, dim=-1)  # 归一化
         
         # 稀疏激活：仅保留 top_k 专家
         topk_weights, topk_indices = torch.topk(weights, self.top_k, dim=-1)  # [batch_size, top_k]
+        # print(f"Shape of top weights: {topk_weights}")
         batch_indices = torch.arange(batch_size, device=weights.device).unsqueeze(1)  # [batch_size, 1]
         sparse_weights = torch.zeros_like(weights)  # [batch_size, num_experts]
         sparse_weights[batch_indices, topk_indices] = topk_weights        
@@ -121,7 +759,7 @@ class MultiExpertImputer(nn.Module):
 
 class MOEOrthAwareMissingEmbeddingGenerator(nn.Module):
     def __init__(self, model, config, num_sections=23, embedding_dim=768, num_heads=8, init_weight=0.5, reduced_dim=256, 
-                delta=0.1, num_experts=2, top_k=2, do_dimension_reduction=True):
+                delta=0.1, num_experts=2, top_k=2, do_dimension_reduction=True,num_layers=3):
         super().__init__()
         self.bert = model
         # self.tokenizer = BertTokenizer.from_pretrained(model_name)
@@ -148,7 +786,8 @@ class MOEOrthAwareMissingEmbeddingGenerator(nn.Module):
 
         nn.init.xavier_uniform_(self.missing_embeddings.weight)
 
-        self.expert_imputer = MultiExpertImputer(num_experts=num_experts, embed_dim=embedding_dim, hidden_dim=reduced_dim, top_k=top_k)
+        self.expert_imputer = MultiExpertImputer(num_experts=num_experts, embed_dim=embedding_dim, hidden_dim=reduced_dim, top_k=top_k,
+                                                 num_layers=num_layers)
         self.to(self.device)
         
         
@@ -217,34 +856,45 @@ class MOEOrthAwareMissingEmbeddingGenerator(nn.Module):
                 # print(f"Default embeddings: {missing_embeddings}")
                 section_embeddings[missing_indices, idx, :] = missing_embeddings 
 
-
+        # print(f"Existing vector: {existing_vectors}")
         mask = existing_vectors.to(device).unsqueeze(-1)  # [batch_size, num_sections, 1]
+        # print(f"Mask: {mask}")
+        # print(f"Shape of Mask: {mask.shape}")
         # 计算加权和并除以存在的 section 数量（避免除 0，加上 eps）
         eps = 1e-8
         context = (section_embeddings * mask).sum(dim=1) / (mask.sum(dim=1) + eps)  # [batch_size, embed_dim]
+        # print(f"Context: {context}")
+        # print(f"Shape of Context: {context.shape}")
         # 2. 构造所有 section 的默认嵌入
         # 对于每个 section（按照固定顺序），通过 missing_embeddings 得到默认 embedding
         default_all = self.missing_embeddings(torch.arange(num_sections, device=device))  # [num_sections, embed_dim]
+        # print(f"Default embedding: {default_all}")
+        # print(f"Default embedding shape: {default_all.shape}")
         # 扩展到 batch： [batch_size, num_sections, embed_dim]
         default_all_exp = default_all.unsqueeze(0).expand(batch_size, -1, -1)
+        # print(f"Expanded default embedding: {default_all_exp.shape}")
         
         # 3. 对于每个 sample、每个 section，我们希望对缺失位置进行 imputation
         # 我们只更新缺失的位置（existing_mask == 0）
         # 为了向量化处理，将 default_all_exp 和 context 扩展到 [batch_size, num_sections, embed_dim]
         context_exp = context.unsqueeze(1).expand(-1, num_sections, -1)  # [batch_size, num_sections, embed_dim]
-        
+        # print(f"Shape of expaned context: {context_exp.shape}")
         # 将两个 tensor 拉平成 [batch_size * num_sections, embed_dim]
         default_flat = default_all_exp.reshape(-1, self.missing_embeddings.embedding_dim)
+        # print(f"Shape of default flat: {default_flat.shape}")
         context_flat = context_exp.reshape(-1, self.missing_embeddings.embedding_dim)
+        # print(f"Shape of context flat: {context_flat.shape}")
         
         # 4. 利用多专家 imputer 对所有位置进行 imputation（后续只选取缺失位置的结果）
         imputed_flat, _ = self.expert_imputer(default_flat, context_flat)  # [batch_size * num_sections, embed_dim]
         imputed_all = imputed_flat.reshape(batch_size, num_sections, self.missing_embeddings.embedding_dim)
+        # print(f"Shape of imputed_all: {imputed_all.shape}")
         
         # 5. 更新 section_embeddings：对于缺失的位置（existing_mask == 0），替换为 imputed_all 的对应值
         # 注意：existing_mask 是 1 表示存在，因此 (1 - existing_mask) 为缺失位置
         existing_mask_float = existing_vectors.unsqueeze(-1).to(device)  # [batch_size, num_sections, 1]
         section_embeddings = existing_mask_float * section_embeddings + (1 - existing_mask_float) * imputed_all
+        # print(f"Shape of section embedding: {section_embeddings.shape}")
         
         # 后续：将更新后的 section_embeddings 输入到注意力层和 predictor 中进行下游任务预测
         if self.do_dimension_reduction:
@@ -255,11 +905,12 @@ class MOEOrthAwareMissingEmbeddingGenerator(nn.Module):
             logits = self.predictor(global_embedding)
         else:
             attn_input = section_embeddings.transpose(0, 1)  # [num_sections, batch_size, embed_dim]
+            # print(f"attn input shape: {attn_input.shape}")
             attn_output, _ = self.attention_layer(attn_input, attn_input, attn_input)
             global_embedding = attn_output.mean(dim=0)  # [batch_size, embed_dim]
             logits = self.predictor(global_embedding)
-
         loss_orth = margin_based_loss(attn_output, delta=self.delta)
+
         return ((loss_orth, None), logits)
 
 

@@ -1,10 +1,14 @@
 import argparse
 import random
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # 设置 matmul 确定性
+os.environ['PYTHONHASHSEED'] = str(0)
 import pickle
 import copy
 import numpy as np
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -21,10 +25,10 @@ from tqdm import tqdm
 
 from data_loader import EHRDataset
 from transformers import AdamW, BertConfig, BertTokenizer, BertForSequenceClassification, \
-        AutoTokenizer, AutoConfig, AutoModel, BertTokenizerFast, set_seed, get_linear_schedule_with_warmup
+        AutoTokenizer, AutoConfig, AutoModel, BertTokenizerFast, set_seed, get_linear_schedule_with_warmup, enable_full_determinism
 from transformers.models.longformer.modeling_longformer import LongformerSelfAttention
 from outcome_models import BertLongForSequenceClassification, LitAugPredictorBienc, LitAugPredictorCrossenc, L2RLitAugPredictorBienc, \
-        OrthAwareMissingEmbeddingGenerator, MOEOrthAwareMissingEmbeddingGenerator
+        OrthAwareMissingEmbeddingGenerator, MOEOrthAwareMissingEmbeddingGenerator, FiLMOrthAwareMissingEmbeddingGenerator,SectionOrthAwareMissingEmbeddingGenerator
 # from info_nce import InfoNCE, info_nce
 # from contrastive_utils import tokenize_and_batch, main_training_loop, move_to_cuda, collate_fn, evaluate, MemoryBank, margin_orthogonal_loss, add_contrastive_loss
 import logging
@@ -40,13 +44,15 @@ wandb.login(key="d7c68693ef5c5723e30df705c6b36f60fc48fb85")
 
 def seed_torch(seed=1029):
     random.seed(seed)   # Python的随机性
-    os.environ['PYTHONHASHSEED'] = str(seed)    # 设置Python哈希种子，为了禁止hash随机化，使得实验可复现
+    # os.environ['PYTHONHASHSEED'] = str(seed)    # 设置Python哈希种子，为了禁止hash随机化，使得实验可复现
     np.random.seed(seed)   # numpy的随机性
     torch.manual_seed(seed)   # torch的CPU随机性，为CPU设置随机种子
     torch.cuda.manual_seed(seed)  # torch的GPU随机性，为当前GPU设置随机种子
     torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU. torch的GPU随机性，为所有GPU设置随机种子
     torch.backends.cudnn.benchmark = False   # if benchmark=True, deterministic will be False
     torch.backends.cudnn.deterministic = True
+    # torch.use_deterministic_algorithms(True) 
+    # torch.use_deterministic_algorithms(True, warn_only=False)
 
 
 def to_cuda(batch):
@@ -186,10 +192,10 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
             print(f"Memory Bank class: {memory_bank.class_counts}")'''
             if isinstance(outputs[0], tuple):
                 ortho_loss = outputs[0][0]
-                if ortho_loss != None:
+                if ortho_loss > 0.0:
 
                     # contrastive_loss = info_nce_loss(outputs[0]) + model.sigmoid(model.weight) * margin_orthogonal_loss(outputs[0][1], outputs[0][2]) 
-                    wloss += orth_weight * ortho_loss
+                    wloss = orth_weight * ortho_loss + (1-orth_weight) * wloss
                     
                     # 记录额外的指标
                     '''wandb.log({
@@ -300,8 +306,8 @@ def test(model, dev_data, dump_test_preds, out_dir, epoch, step,
             wloss = weighted_ce_loss(logits, gpu_batch["labels"])
             if isinstance(outputs[0], tuple):
                 ortho_loss = outputs[0][0]
-                if ortho_loss != None:
-                    wloss += orth_weight * ortho_loss
+                if ortho_loss > 0.0 :
+                    wloss = orth_weight * ortho_loss + (1 - orth_weight) * wloss
                     
                     # 记录额外的指标
                     '''wandb.log({
@@ -629,9 +635,9 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         do_train, do_test, checkpoint, attention_window, max_pos,
         batch_size, lr, epochs, seed, accumulation_steps, num_top_docs, strategy, enc_strategy,
         use_warmup, warmup_steps, stop_on_roc, dump_test_preds, use_pico, doc_embeds, l2r_top_docs,
-        outcome, retrieval_labels, query_proj, query_loss, run_name, num_head=0, section_segment=False,  
+        outcome, retrieval_labels, query_proj, query_loss, run_name, num_heads=0, section_segment=False,  
         module_type='full', orth_weight=0.1, reduced_dimension=256, delta=0.1, num_experts=8, top_k=2,
-        do_dimension_reduction=True, ):
+        do_dimension_reduction=True, num_layers=3, condition_dim=128, enable_full=False):
 
     assert accumulation_steps % batch_size == 0, "accumulation_steps must be a multiple of batch_size"
     
@@ -654,7 +660,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
             )
         else:
             out_dir = os.path.join(
-                out_dir, f"{outcome}/{init_model}/{section_segment}/{module_type}/{orth_weight}/{delta}/{top_k}/{num_experts}/{run_name}"
+                out_dir, f"{outcome}/{init_model}/{section_segment}/{module_type}/{orth_weight}/{delta}/{num_heads}/{run_name}"
             )
     else:
         if longmodel_dir is not None:
@@ -674,10 +680,12 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         os.makedirs(checkpoint_dir)
     # 创建目录（如果不存在）
 
-
-    
-    seed_torch(seed)
-    set_seed(seed)
+    if enable_full:
+        # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+        enable_full_determinism(seed)
+    else:
+        # seed_torch(seed)
+        set_seed(seed)
     setproctitle.setproctitle("python")
 
     outcome_questions = {'mortality': 'What is the hospital mortality? ',
@@ -809,12 +817,30 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
             model = MOEOrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections,
                                                           reduced_dim=reduced_dimension, delta=delta,
                                                           do_dimension_reduction=do_dimension_reduction,
-                                                          num_experts=num_experts, top_k=top_k)
+                                                          num_experts=num_experts, top_k=top_k, num_layers=num_layers)
+        elif module_type == 'FiLM_orth':
+            print(f"Test FiLM Orthogonal Performance")
+            model = FiLMOrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections,
+                                                           reduced_dim=reduced_dimension, delta=delta,
+                                                           do_dimension_reduction=do_dimension_reduction,
+                                                           condition_dim=condition_dim)
+        elif module_type == 'Co_orth':
+            print(f"Test Corelation Orthogonal Performance")
+            model = SectionOrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections,
+                                                             delta=delta,num_heads=num_heads)
+            '''def print_parameter_stats(model, name_filter=None):
+                for name, param in model.named_parameters():
+                    if name_filter is None or name_filter in name:
+                        print(f"{name}: mean={param.data.mean():.6f}, std={param.data.std():.6f}, norm={param.data.norm():.6f}")
+            print_parameter_stats(model)
+            exit(0)'''
+                        
+            
         # model = ContextAwareMissingEmbeddingGenerator(config=config, model=model,num_sections=len(selected_sections), la_alpha=la_alpha)
     else:
         if lit_ranks is not None and doc_embeds is None: # we're training with literature, and we don't use existing embeddings
             if enc_strategy == 'bienc':
-                model = LitAugPredictorBienc(config, model, num_top_docs, strategy, num_head=num_head)
+                model = LitAugPredictorBienc(config, model, num_top_docs, strategy, num_head=num_heads)
                 print("Model is: LitAugPredictorBienc()")
             elif enc_strategy == 'crossenc':
                 model = LitAugPredictorCrossenc(config, model, num_top_docs, strategy)
@@ -1122,18 +1148,20 @@ if __name__ == '__main__':
     parser.add_argument('--run_name', type=str, default="deault run name", action='store', help='name of the run')
     # Context specific augmentation 
     # parser.add_argument('--context_augment', action='store_true', default=False, help='Specify if use the ')
-    parser.add_argument('--num_head', type=int, action='store', help='number of head in multi-head attention block')
+    parser.add_argument('--num_heads', type=int, action='store', help='number of head in multi-head attention block')
     parser.add_argument('--section_segment', action='store_true', default=False, help='Decide if segment the EHR by section')
     parser.add_argument('--module_type', type=str, action='store', default='base', help='module type')
-    parser.add_argument('--delta', type=float, action='store', default=0.1, help='margin for orthogonal regulation')
-    parser.add_argument('--orth_weight', type=float, action='store', default=0.1, help='weight of the orthogonal loss')
+    parser.add_argument('--delta', type=float, action='store', default=0.0, help='margin for orthogonal regulation')
+    parser.add_argument('--orth_weight', type=float, action='store', default=0.0, help='weight of the orthogonal loss')
     parser.add_argument('--do_dimension_reduction', action='store_true', default=False, help='decide if we use the dimension reduction')
     parser.add_argument('--reduced_dimension', type=int, action='store', default=256, help='reduced dimension')
     parser.add_argument('--num_experts', type=int, action='store', default=0, help='number of experts for MOE module')
+    parser.add_argument('--num_layers', type=int, action='store', default=3, help='number of linear layers for position encoding')
     # KNN moe hyperparameter
     parser.add_argument('--top_k', type=int, action='store', default=0, help="Number of experts to be chosen")
+    parser.add_argument('--condition_dim', type=int, action='store', default=0, help='Dimension of the condition')
+    parser.add_argument('--enable_full', action='store_true', default=False)
 
-    # parser.add_argument('--do_train', action='store_true', default=False, help='Specify if training should be performed')
     args = parser.parse_args()
     args_dict = vars(args)
 
@@ -1151,9 +1179,9 @@ if __name__ == '__main__':
         args.delta = None
         args.orth_weight = None
         args.reduced_dimension = None
-        args.lambda_residual = None
-        args.ssa_softmax_temp = None
-        args.pooling_mode = None
+    
+    if not args.do_dimension_reduction:
+        args.reduced_dimension = 768
         
     if not args.use_warmup:
         args.warmup_steps = None
@@ -1179,6 +1207,10 @@ if __name__ == '__main__':
                 'use_warmup': args.use_warmup,
                 'warmup_steps': args.warmup_steps,
                 'lr':args.lr,
+                'num_layers': args.num_layers,
+                'condition_dim': args.condition_dim,
+                'num_heads': args.num_heads,
+                'enable_full': args.enable_full
             }
         )  # 直接同步所有超参数
 
