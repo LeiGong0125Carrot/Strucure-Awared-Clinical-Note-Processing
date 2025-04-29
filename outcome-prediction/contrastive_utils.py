@@ -24,6 +24,37 @@ def add_contrastive_loss(outputs, model, memory_bank, info_nce_loss, logger, ste
     ortho_loss = margin_orthogonal_loss(pos_features, neg_features)
     
     return contrastive_loss, adaptive_weight, ortho_loss
+def residual_independent_fusion_average(section_embeddings, g, alpha, lambda_residual=0.1):
+    """
+    section_embeddings: (batch, num_sections, embedding_dim)
+    g: (batch, num_sections, 1) 门控权重
+    alpha: (batch, num_sections, 1) 结构感知注意力
+    """
+    # 计算加权求和的全局表示
+    weighted_sum = (g * alpha * section_embeddings).sum(dim=1)  # (batch, embedding_dim)
+    # 用每个样本各个 section embedding 的均值作为残差
+    residual = lambda_residual * section_embeddings.mean(dim=1)  # (batch, embedding_dim)
+    final_embedding = weighted_sum + residual
+    return final_embedding
+
+
+def residual_independent_fusion(section_embeddings, g, alpha, lambda_residual=0.1):
+    """
+    section_embeddings: (batch, num_sections, embedding_dim)
+    g: (batch, num_sections, 1) 门控权重
+    alpha: (batch, num_sections, 1) 结构感知注意力
+    """
+    # print(f"Before Residual shap: {section_embeddings.shape}")
+    weighted_sum = (g * alpha * section_embeddings).sum(dim=1)  # (batch, embedding_dim)
+    # print(f"Weighted Sum shape: {weighted_sum.shape}")
+    # print(f"Weighted Sum: {weighted_sum}")
+    residual = lambda_residual * section_embeddings.sum(dim=1)  # (batch, embedding_dim)
+    # print(f"Residual Shape: {residual.shape}")
+    # print(f"Residual: {residual}")
+    final_embedding = weighted_sum + residual
+    # print(f"Final Shape: {(final_embedding.shape)}")
+    # print(f"Final: {final_embedding}")
+    return weighted_sum + residual
 
 
 def margin_orthogonal_loss(pos_features, neg_features, margin=0.1, epsilon=1e-8):
@@ -47,6 +78,20 @@ def margin_orthogonal_loss(pos_features, neg_features, margin=0.1, epsilon=1e-8)
    loss = torch.mean(torch.relu(torch.abs(inner_products) * mask - margin))
    
    return loss
+   
+def margin_based_loss(section_embeddings, delta=0.1):
+    """
+    计算 margin-based 解耦损失，确保 section embeddings 之间的独立性
+    section_embeddings: (batch_size, num_sections, embedding_dim)
+    """
+    batch_size, num_sections, embedding_dim = section_embeddings.shape
+    norm_emb = F.normalize(section_embeddings, p=2, dim=-1)  # 归一化
+    similarity_matrix = torch.bmm(norm_emb, norm_emb.transpose(1, 2))  # 计算 pairwise 相似度
+
+    mask = ~torch.eye(num_sections, device=section_embeddings.device, dtype=bool)  # 排除自身
+    loss = torch.clamp(similarity_matrix[:, mask] - delta, min=0).mean()  # 计算 margin-based loss
+
+    return loss
 
 def check_pairs_labels(anchor_features, positive_features, negative_features, anchor_labels, memory_bank=None):
     batch_size = anchor_features.shape[0]

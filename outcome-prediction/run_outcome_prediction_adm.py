@@ -1,9 +1,14 @@
 import argparse
 import random
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # 设置 matmul 确定性
+os.environ['PYTHONHASHSEED'] = str(0)
 import pickle
 import copy
 import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -20,14 +25,14 @@ from tqdm import tqdm
 
 from data_loader import EHRDataset
 from transformers import AdamW, BertConfig, BertTokenizer, BertForSequenceClassification, \
-        AutoTokenizer, AutoConfig, AutoModel, BertTokenizerFast, set_seed, get_linear_schedule_with_warmup
+        AutoTokenizer, AutoConfig, AutoModel, BertTokenizerFast, set_seed, get_linear_schedule_with_warmup, enable_full_determinism
 from transformers.models.longformer.modeling_longformer import LongformerSelfAttention
 from outcome_models import BertLongForSequenceClassification, LitAugPredictorBienc, LitAugPredictorCrossenc, L2RLitAugPredictorBienc, \
-        ContextAwareMissingEmbeddingGenerator, ContextAwareContrastiveEmbeddingGenerator
-from info_nce import InfoNCE, info_nce
-from contrastive_utils import tokenize_and_batch, main_training_loop, move_to_cuda, collate_fn, evaluate, MemoryBank, margin_orthogonal_loss, add_contrastive_loss
+        OrthAwareMissingEmbeddingGenerator, MOEOrthAwareMissingEmbeddingGenerator, FiLMOrthAwareMissingEmbeddingGenerator,SectionOrthAwareMissingEmbeddingGenerator
+# from info_nce import InfoNCE, info_nce
+# from contrastive_utils import tokenize_and_batch, main_training_loop, move_to_cuda, collate_fn, evaluate, MemoryBank, margin_orthogonal_loss, add_contrastive_loss
 import logging
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 # 配置logger
 logger = logging.getLogger(__name__)
@@ -39,13 +44,15 @@ wandb.login(key="d7c68693ef5c5723e30df705c6b36f60fc48fb85")
 
 def seed_torch(seed=1029):
     random.seed(seed)   # Python的随机性
-    os.environ['PYTHONHASHSEED'] = str(seed)    # 设置Python哈希种子，为了禁止hash随机化，使得实验可复现
+    # os.environ['PYTHONHASHSEED'] = str(seed)    # 设置Python哈希种子，为了禁止hash随机化，使得实验可复现
     np.random.seed(seed)   # numpy的随机性
     torch.manual_seed(seed)   # torch的CPU随机性，为CPU设置随机种子
     torch.cuda.manual_seed(seed)  # torch的GPU随机性，为当前GPU设置随机种子
     torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU. torch的GPU随机性，为所有GPU设置随机种子
     torch.backends.cudnn.benchmark = False   # if benchmark=True, deterministic will be False
     torch.backends.cudnn.deterministic = True
+    # torch.use_deterministic_algorithms(True) 
+    # torch.use_deterministic_algorithms(True, warn_only=False)
 
 
 def to_cuda(batch):
@@ -123,15 +130,9 @@ def create_long_model(init_model, save_model_to, attention_window, max_pos, num_
 
 
 def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_steps, strategy,
-          use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment, do_laplacian_augment, 
-          do_contrastive_loss=False, alpha=0.0, temperature=0.2, max_negatives=4, memory_bank_load_amount=8192):
+          use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment, orth_weight):
     # print('Dropout default" {}'.format(model.config.hidden_dropout_prob))
-    if do_contrastive_loss:
-        memory_bank = MemoryBank(feature_dim=768, max_size=memory_bank_load_amount)
-        info_nce_loss = InfoNCE(temperature=temperature, reduction='mean', negative_mode='paired')
-    else:
-        memory_bank = None
-        info_nce_loss = None
+
     weights = torch.cuda.FloatTensor([x[1] for x in list(sorted(class_weights.items(), key=lambda x:x[0]))])
     weighted_ce_loss = nn.CrossEntropyLoss(weight=weights)
     print(f"Start Downstream Task Fine Tuning")
@@ -178,12 +179,8 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
                 outputs = model(**gpu_batch)
             else:
                 gpu_batch = to_cuda(batch)
-                if do_laplacian_augment == True:
-                    outputs = model.laplacian_forward(gpu_batch, do_contrastive_loss=do_contrastive_loss, 
-                                                      memory_bank=memory_bank, max_negatives=max_negatives,mode='train')
-                else:
-                    outputs = model(gpu_batch, do_contrastive_loss=do_contrastive_loss, memory_bank=memory_bank, 
-                                    max_negatives=max_negatives, mode='train')
+                outputs = model(gpu_batch)
+
 
             logits = outputs[1]
             wloss = weighted_ce_loss(logits, gpu_batch["labels"])
@@ -193,34 +190,27 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
             }
             '''print(f"Memory Bank Status: {memory_bank.has_sufficient_samples(min_samples_per_class=4)}")
             print(f"Memory Bank class: {memory_bank.class_counts}")'''
-            if outputs[0] is not None and do_contrastive_loss == True and memory_bank.has_sufficient_samples(min_samples_per_class=max_negatives):
-                if step % 100 == 0:  # 监控memory bank状态
-                    status = memory_bank.get_status()
-                    print(f"Memory bank status:", status)
-                    print(f"Contrastive learning {'activated' if memory_bank.contrastive_loss_activated else 'not activated'}")
-                
-                # contrastive_loss = info_nce_loss(outputs[0]) + model.sigmoid(model.weight) * margin_orthogonal_loss(outputs[0][1], outputs[0][2]) 
-                contrastive_loss, adaptive_weight, ortho_loss = add_contrastive_loss(outputs, model, memory_bank, info_nce_loss, logger, step)
-                combined_loss = alpha * (contrastive_loss + adaptive_weight * ortho_loss)
-                wloss += combined_loss
-                
-                # 记录额外的指标
-                '''wandb.log({
-                    "contrastive_loss": contrastive_loss.item(),
-                    "total_samples_in_memory": len(memory_bank),
-                    "step": step ,
-                    "epoch": epoch + 1,
-                    "adaptive_weight": adaptive_weight,
-                    "ortho_loss": ortho_loss
-                })'''
+            if isinstance(outputs[0], tuple):
+                ortho_loss = outputs[0][0]
+                if ortho_loss > 0.0:
 
-                metrics.update({
-                    "contrastive_loss": contrastive_loss.item(),
-                    "total_samples_in_memory": len(memory_bank),
-                    "adaptive_weight": adaptive_weight,
-                    "ortho_loss": ortho_loss,
-                    "train_loss": wloss.item() / acc_factor
-                })
+                    # contrastive_loss = info_nce_loss(outputs[0]) + model.sigmoid(model.weight) * margin_orthogonal_loss(outputs[0][1], outputs[0][2]) 
+                    wloss = orth_weight * ortho_loss + (1-orth_weight) * wloss
+                    
+                    # 记录额外的指标
+                    '''wandb.log({
+                        "contrastive_loss": contrastive_loss.item(),
+                        "total_samples_in_memory": len(memory_bank),
+                        "step": step ,
+                        "epoch": epoch + 1,
+                        "adaptive_weight": adaptive_weight,
+                        "ortho_loss": ortho_loss
+                    })'''
+
+                    metrics.update({
+                        "orthogonal_loss": ortho_loss,
+                        "train_loss": wloss.item() / acc_factor
+                    })
             wloss /= acc_factor
             epoch_loss += wloss.item()
             wloss.backward()
@@ -239,10 +229,7 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
             if step%val_steps == 0:
                 print('Completed {}/{} training steps'.format(step, num_train_examples))
                 dev_loss, auroc = test(model, dev_data, dump_test_preds, out_dir, epoch, step=step,
-                                       return_loss=True, class_weights=class_weights, strategy=strategy, section_segment=section_segment,
-                                       do_laplacian_augment=do_laplacian_augment, do_contrastive_loss=do_contrastive_loss,
-                                       memory_bank=memory_bank, info_nce_loss=info_nce_loss, max_negatives=max_negatives,
-                                       alpha=alpha)
+                                       return_loss=True, class_weights=class_weights, strategy=strategy, section_segment=section_segment, orth_weight=orth_weight)
                 if not stop_on_roc and dev_loss < prev_dev_loss: # stop on loss
                     prev_dev_loss = dev_loss
                     torch.save(model.state_dict(), os.path.join(out_dir, 'best_model.pt'))
@@ -270,10 +257,7 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
             'loss': epoch_loss,
         }, os.path.join(out_dir, 'checkpoints/checkpoint_{}.pt'.format(epoch)))'''
         dev_loss, auroc = test(model, dev_data, dump_test_preds, out_dir, epoch, step="end",
-                               return_loss=True, class_weights=class_weights, strategy=strategy, section_segment=section_segment,
-                               do_laplacian_augment=do_laplacian_augment, do_contrastive_loss=do_contrastive_loss,
-                               memory_bank=memory_bank, info_nce_loss=info_nce_loss, max_negatives=max_negatives,
-                               alpha=alpha)
+                               return_loss=True, class_weights=class_weights, strategy=strategy, section_segment=section_segment, orth_weight=orth_weight)
         if dev_loss < prev_dev_loss:
             prev_dev_loss = dev_loss
             torch.save(model.state_dict(), os.path.join(out_dir, 'best_model.pt'))
@@ -281,8 +265,7 @@ def train(model, train_data, dev_data, out_dir, epochs, lr, class_weights, acc_s
 
 
 def test(model, dev_data, dump_test_preds, out_dir, epoch, step,
-         return_loss=False, class_weights=None, strategy='average', section_segment=False, do_laplacian_augment=False,
-         do_contrastive_loss=False, memory_bank=None, info_nce_loss=None, max_negatives=4, alpha=0):
+         return_loss=False, class_weights=None, strategy='average', section_segment=False, orth_weight=0.1):
     with torch.no_grad():
         model.eval()
         unique_labels = list(class_weights.keys())
@@ -310,12 +293,8 @@ def test(model, dev_data, dump_test_preds, out_dir, epoch, step,
                 outputs = model(**gpu_batch)
             else:
                 gpu_batch = to_cuda(batch)
-                if do_laplacian_augment == True:
-                    outputs = model.laplacian_forward(gpu_batch,do_contrastive_loss=do_contrastive_loss,
-                                                      memory_bank=memory_bank, max_negatives=max_negatives, mode='test')
-                else:
-                    outputs = model(gpu_batch, do_contrastive_loss=do_contrastive_loss,
-                                    memory_bank=memory_bank, max_negatives=max_negatives, mode='test')
+                outputs = model(gpu_batch)
+                
             
             
             logits = outputs[1]
@@ -325,21 +304,30 @@ def test(model, dev_data, dump_test_preds, out_dir, epoch, step,
             probs = probs if len(unique_labels) > 2 else probs[:,1]
             
             wloss = weighted_ce_loss(logits, gpu_batch["labels"])
-            if outputs[0] is not None and do_contrastive_loss == True and memory_bank.has_sufficient_samples(min_samples_per_class=max_negatives) and step != 'test':
-                # contrastive_loss = info_nce_loss(outputs[0]) + model.sigmoid(model.weight) * margin_orthogonal_loss(outputs[0][1], outputs[0][2]) 
-                contrastive_loss, adaptive_weight, ortho_loss = add_contrastive_loss(outputs, model, memory_bank, info_nce_loss, logger, step)
-                combined_loss = alpha * (contrastive_loss + adaptive_weight * ortho_loss)
-                wloss += combined_loss
-                
-                # 记录额外的指标
-                '''wandb.log({
-                    "validation_contrastive_loss": contrastive_loss.item(),
-                    "total_samples_in_memory": len(memory_bank),
-                    "step": step,
-                    "epoch": epoch + 1,
-                    "adaptive_weight": adaptive_weight,
-                    "valiadation_ortho_loss": ortho_loss
-                })'''
+            if isinstance(outputs[0], tuple):
+                ortho_loss = outputs[0][0]
+                if ortho_loss > 0.0 :
+                    wloss = orth_weight * ortho_loss + (1 - orth_weight) * wloss
+                    
+                    # 记录额外的指标
+                    '''wandb.log({
+                        "contrastive_loss": contrastive_loss.item(),
+                        "total_samples_in_memory": len(memory_bank),
+                        "step": step ,
+                        "epoch": epoch + 1,
+                        "adaptive_weight": adaptive_weight,
+                        "ortho_loss": ortho_loss
+                    })'''
+                    
+                    # 记录额外的指标
+                    '''wandb.log({
+                        "validation_contrastive_loss": contrastive_loss.item(),
+                        "total_samples_in_memory": len(memory_bank),
+                        "step": step,
+                        "epoch": epoch + 1,
+                        "adaptive_weight": adaptive_weight,
+                        "valiadation_ortho_loss": ortho_loss
+                    })'''
             dev_loss += wloss.item()
             all_pred_probs += probs.detach().cpu().numpy().tolist()
             all_labels += gpu_batch["labels"].cpu().numpy().tolist()
@@ -647,44 +635,42 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         do_train, do_test, checkpoint, attention_window, max_pos,
         batch_size, lr, epochs, seed, accumulation_steps, num_top_docs, strategy, enc_strategy,
         use_warmup, warmup_steps, stop_on_roc, dump_test_preds, use_pico, doc_embeds, l2r_top_docs,
-        outcome, retrieval_labels, query_proj, query_loss, num_head=0, section_segment=False, do_contrastive=False, 
-        max_negatives=10, contrastive_epochs=20, contrastive_batch_size=8, alpha=0.1, temperature=0.1,negative_pair_strategy='normal',
-        max_samples_per_outcome=1000, contrastive_lr=1e-5,section_selection='full',trained_contrastive_checkpoint_dir=None,
-        do_laplacian_augment=False, la_alpha=0.0,do_contrastive_loss=False, memory_bank_load_amount=8192):
+        outcome, retrieval_labels, query_proj, query_loss, run_name, num_heads=0, section_segment=False,  
+        module_type='full', orth_weight=0.1, reduced_dimension=256, delta=0.1, num_experts=8, top_k=2,
+        do_dimension_reduction=True, num_layers=3, condition_dim=128, enable_full=False):
 
     assert accumulation_steps % batch_size == 0, "accumulation_steps must be a multiple of batch_size"
-    if trained_contrastive_checkpoint_dir == "None":
-        trained_contrastive_checkpoint_dir = None
-    section_names = [
-            'discharge diagnosis', 'major surgical or invasive procedure', 'history of present illness',
-            'past medical history', 'brief hospital course', 'chief complaint', 'family history',
-            'physical exam', 'admission date', 'discharge date', 'service', 'date of birth',
-            'sex', 'allergies', 'social history', 'discharge disposition', 'discharge medications',
-            'medications on admission', 'attending', 'discharge condition', 'discharge instructions',
-            'followup instructions', 'pertinent results'
-        ]
-    refined_section_names = ['discharge diagnosis', 'major surgical or invasive procedure', 'history of present illness',
-            'past medical history', 'brief hospital course', 'chief complaint', 'family history',
-            'physical exam', 'service', 'date of birth', 'sex', 'allergies', 'social history', 'discharge disposition', 
-            'discharge medications', 'medications on admission', 'attending', 'discharge condition', 'discharge instructions',
-            'followup instructions', 'pertinent results']
     
-    admission_names = ['chief complaint', 'allergies', 'social history', 'medications on admission', 'past medical history'
-                              'physical exam', 'family history', 'medical history']
+    admission_section_names = [
+        "past medical history", "chief complaint", "family history", "physical exam", "allergies", "social history",
+        "medications on admission", "present illness"
+    ]
     
-    selected_sections = None
-    if section_selection == 'full':
-        selected_sections = section_names
-    elif section_selection == 'refine':
-        selected_sections = refined_section_names
-    else:
-        selected_sections = admission_names
+    selected_sections = admission_section_names
 
     print(f"Number of sections selected: {len(selected_sections)}")
         
-    
 
 
+    # 构造 out_dir
+    if section_segment == True:
+        if module_type == 'orth':
+            out_dir = os.path.join(
+                out_dir, f"{outcome}/{init_model}/{section_segment}/{module_type}/{orth_weight}/{delta}/{reduced_dimension}/{run_name}"
+            )
+        else:
+            out_dir = os.path.join(
+                out_dir, f"{outcome}/{init_model}/{section_segment}/{module_type}/{orth_weight}/{delta}/{num_heads}/{run_name}"
+            )
+    else:
+        if longmodel_dir is not None:
+            out_dir = os.path.join(
+                out_dir, f"{outcome}/{init_model}/long/{module_type}/{run_name}"
+            )
+        else:
+            out_dir = os.path.join(
+                out_dir, f"{outcome}/{init_model}/raw/{module_type}/{run_name}"
+            )
     if longmodel_dir is not None and not os.path.exists(longmodel_dir):
         os.makedirs(longmodel_dir)
     if not os.path.exists(out_dir):
@@ -692,9 +678,14 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
     checkpoint_dir = os.path.join(out_dir, 'checkpoints')
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
-    
-    seed_torch(seed)
-    set_seed(seed)
+    # 创建目录（如果不存在）
+
+    if enable_full:
+        # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+        enable_full_determinism(seed)
+    else:
+        # seed_torch(seed)
+        set_seed(seed)
     setproctitle.setproctitle("python")
 
     outcome_questions = {'mortality': 'What is the hospital mortality? ',
@@ -731,7 +722,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
 
     
     num_labels = len(list(dataset.class_weights.keys()))
-    
+    print(f"Total Number of labels: {num_labels}")
     if retrieval_labels is not None:
         retrieval_labels = pickle.load(open(retrieval_labels, 'rb'))
 
@@ -758,6 +749,7 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         model = BertLongForSequenceClassification.from_pretrained(model_path, config=config, cache_dir='../cache') \
             if longmodel_dir is not None \
             else BertForSequenceClassification.from_pretrained(model_path, config=config, cache_dir='../cache')
+
     rerank_config, rerank_tokenizer, rerank_model = None, None, None
     if rerank_model_path is not None:
         rerank_label_vocab = {'Relevant': 1, 'Irrelevant': 0}
@@ -790,7 +782,8 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
         model.resize_token_embeddings(len(tokenizer))
         print('Added additional special tokens for PICO highlights')
-    if section_segment:
+    print(f"Wether use section segment: {section_segment}")
+    if section_segment == True:
         config = BertConfig.from_pretrained(
             init_model,
             num_labels=num_labels,
@@ -812,23 +805,42 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         )
         # Step 4: use custom class to extend the base model
         print(f"Create Section-Based Model")
-        if do_contrastive:
-            if trained_contrastive_checkpoint_dir is None:
-                model = ContextAwareContrastiveEmbeddingGenerator(config=config, model=model, num_sections=len(selected_sections), la_alpha=la_alpha)
-            else:
-                # 创建模型实例（与保存时的架构和配置一致）
-                model = ContextAwareContrastiveEmbeddingGenerator(config=config)
+        num_sections = len(selected_sections)
 
-                # 加载模型权重
-                checkpoint = torch.load(os.path.join(trained_contrastive_checkpoint_dir, 'best_model.pt'))
-                model.load_state_dict(checkpoint['model_state_dict'])  # 只加载模型参数
-
-        else:
-            model = ContextAwareMissingEmbeddingGenerator(config=config, model=model,num_sections=len(selected_sections), la_alpha=la_alpha)
+        if module_type == 'orth':
+            print(f"Test Orhtogonal Only Performance")
+            model = OrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections, 
+                                                       reduced_dim=reduced_dimension, delta=delta,
+                                                       do_dimension_reduction=do_dimension_reduction)
+        elif module_type == 'moe_orth':
+            print(f"Test Moe Orthogonal Performance")
+            model = MOEOrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections,
+                                                          reduced_dim=reduced_dimension, delta=delta,
+                                                          do_dimension_reduction=do_dimension_reduction,
+                                                          num_experts=num_experts, top_k=top_k, num_layers=num_layers)
+        elif module_type == 'FiLM_orth':
+            print(f"Test FiLM Orthogonal Performance")
+            model = FiLMOrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections,
+                                                           reduced_dim=reduced_dimension, delta=delta,
+                                                           do_dimension_reduction=do_dimension_reduction,
+                                                           condition_dim=condition_dim)
+        elif module_type == 'Co_orth':
+            print(f"Test Corelation Orthogonal Performance")
+            model = SectionOrthAwareMissingEmbeddingGenerator(config=config, model=model, num_sections=num_sections,
+                                                             delta=delta,num_heads=num_heads)
+            '''def print_parameter_stats(model, name_filter=None):
+                for name, param in model.named_parameters():
+                    if name_filter is None or name_filter in name:
+                        print(f"{name}: mean={param.data.mean():.6f}, std={param.data.std():.6f}, norm={param.data.norm():.6f}")
+            print_parameter_stats(model)
+            exit(0)'''
+                        
+            
+        # model = ContextAwareMissingEmbeddingGenerator(config=config, model=model,num_sections=len(selected_sections), la_alpha=la_alpha)
     else:
         if lit_ranks is not None and doc_embeds is None: # we're training with literature, and we don't use existing embeddings
             if enc_strategy == 'bienc':
-                model = LitAugPredictorBienc(config, model, num_top_docs, strategy, num_head=num_head)
+                model = LitAugPredictorBienc(config, model, num_top_docs, strategy, num_head=num_heads)
                 print("Model is: LitAugPredictorBienc()")
             elif enc_strategy == 'crossenc':
                 model = LitAugPredictorCrossenc(config, model, num_top_docs, strategy)
@@ -841,8 +853,8 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
                                                 query_proj)
             if query_loss is not None:
                 model.query_loss = query_loss
-    # print(f"Model: {model}")
     model = model.cuda()
+    print(f"Model: {model}")
 
     # print('Initialized longformer model with pretrained LM...')
 
@@ -950,23 +962,6 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
         - batch_result: dict，包含分词后的批次数据，包括对缺失部分的处理。
         """
         # 初始化用于保存所有 EHR 分词结果的结构
-        '''section_names = [
-            'discharge diagnosis', 'major surgical or invasive procedure', 'history of present illness',
-            'past medical history', 'brief hospital course', 'chief complaint', 'family history',
-            'physical exam', 'admission date', 'discharge date', 'service', 'date of birth',
-            'sex', 'allergies', 'social history', 'discharge disposition', 'discharge medications',
-            'medications on admission', 'attending', 'discharge condition', 'discharge instructions',
-            'followup instructions', 'pertinent results'
-        ]'''
-
-        '''section_names = ['discharge diagnosis', 'major surgical or invasive procedure', 'history of present illness',
-            'past medical history', 'brief hospital course', 'chief complaint', 'family history',
-            'physical exam', 'service', 'date of birth', 'sex', 'allergies', 'social history', 'discharge disposition', 
-            'discharge medications', 'medications on admission', 'attending', 'discharge condition', 'discharge instructions',
-            'followup instructions', 'pertinent results']'''
-        '''admission_names = ['chief complaint', 'allergies', 'social history', 'medications on admission', 'past medical history'
-                              'physical exam', 'family history', 'medical history']'''
-
 
         batch_result = {
             "ehr_id": [],
@@ -1092,90 +1087,23 @@ def run(train_path, dev_path, test_path, lit_ranks, lit_file, init_model,
             # test_batches = dev_batches
             print('Created {} Section-based test batches'.format(len(test_batches)))
             # print("Pass")
-
-    print(f"Model: {model}")
-    if args.do_contrastive:
-        # load the dataset from the EHRdataset
-        contrastive_checkpoint_dir = os.path.join(out_dir, 'contrastive_checkpoints')
-        if not os.path.exists(contrastive_checkpoint_dir):
-            os.makedirs(contrastive_checkpoint_dir)
-        print(f"Contrastive checkpoint dir: {contrastive_checkpoint_dir}")
-        preprocessed_data = dataset.preprocess_ehr_data_with_sampling(dataset.train_data, max_samples_per_outcome=max_samples_per_outcome)
-        # dev_preprocessed_data = dataset.preprocess_ehr_data_with_sampling(dataset.dev_data, max_samples_per_outcome=max_samples_per_outcome)
+    
+    if do_train:
+        train(model, train_batches, dev_batches, out_dir, epochs, lr, dataset.class_weights,
+            accumulation_steps, strategy, use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment, orth_weight)
+    if do_test:
+        if checkpoint is not None: # 如果训练中断，加载一个中间段的checkpoint
+            if 'checkpoint' in checkpoint:
+                full_checkpoint = torch.load(checkpoint)
+                model.load_state_dict(full_checkpoint['model_state_dict'])
+            else: #如果直接load best_model
+                model.load_state_dict(torch.load(checkpoint))
+                print('Loaded checkpoint')
+        else: # 训练结束后，直接加载best model
+            model.load_state_dict(torch.load(os.path.join(out_dir, 'best_model.pt')))
         
-        if negative_pair_strategy == 'refine':
-            contrastive_data = dataset.add_contrastive_data_optimized(preprocessed_data, max_negatives=max_negatives)
-            # print(f"Number of contrastive training data: {len(contrastive_data)}")
-            # eval_data = dataset.add_contrastive_data_optimized(dev_preprocessed_data, max_negatives=max_negatives)
-        elif negative_pair_strategy == 'final':
-            contrastive_data = dataset.add_contrastive_data_multiclass_efficient(preprocessed_data, max_negatives)
-        elif negative_pair_strategy == 'balance':
-            print(f"Used the balanced section selection methods!")
-            contrastive_data = dataset.add_contrastive_data_multiclass_diff_section_negatives_with_min_section(preprocessed_data, max_negatives)
-            # eval_data = dataset.add_contrastive_data_multiclass_diff_section_negatives(dev_preprocessed_data, max_negatives)
-        print(f"Number of contrastive train data: {len(contrastive_data)}")
-        # print(f"Number of contrastive eval data: {len(eval_data)}")
-        # print(f"Contrastive train data example: {contrastive_data[0]}")
-        # print(f"Contrastive eval data example: {eval_data[0]}")
-        tokenized_data = [tokenize_and_batch(sample, tokenizer) for sample in tqdm(contrastive_data)]
-        # dev_tokenized_data = [tokenize_and_batch(sample, tokenizer) for sample in tqdm(eval_data)] 
-
-        dataloader = DataLoader(tokenized_data, 
-                                batch_size=contrastive_batch_size, 
-                                collate_fn=collate_fn,
-                                num_workers=4,  # 根据服务器的 CPU 核心数调整
-                                pin_memory=True)
-        '''eval_dataloader = DataLoader(dev_tokenized_data, 
-                                    batch_size=contrastive_batch_size, 
-                                    collate_fn=collate_fn,
-                                    num_workers=8,  # 根据服务器的 CPU 核心数调整
-                                    pin_memory=True)   ''' 
-
-        print("Start Contrastive Training!")
-        main_training_loop(dataloader, model, contrastive_checkpoint_dir, alpha, num_epochs=contrastive_epochs, 
-                           temperature=temperature, contrastive_lr=contrastive_lr, trained_contrastive_checkpoint_dir=trained_contrastive_checkpoint_dir)
-        print("Contrastive Training Finished!")
-
-        best_checkpoint_path = os.path.join(contrastive_checkpoint_dir, "best_model.pt")
-        print(f"Best Contrastive checkpoint path: {best_checkpoint_path}")
-        best_checkpoint = torch.load(best_checkpoint_path)
-        model.load_state_dict(best_checkpoint['model_state_dict'])
-        print(model)
-        
-        if do_train:
-            train(model, train_batches, dev_batches, out_dir, epochs, lr, dataset.class_weights,
-                  accumulation_steps, strategy, use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment,do_laplacian_augment, do_contrastive_loss)
-        if do_test:
-            if  checkpoint is not None:
-                    if 'checkpoint' in checkpoint:
-                        full_checkpoint = torch.load(checkpoint)
-                        model.load_state_dict(full_checkpoint['model_state_dict'])
-                    else:
-                        model.load_state_dict(torch.load(checkpoint))
-                        print('Loaded checkpoint')
-            else:
-                model.load_state_dict(torch.load(os.path.join(out_dir, 'best_model.pt')))
-
-            test(model, test_batches, dump_test_preds, out_dir, epoch="end", step="test",
-                    class_weights=dataset.class_weights, strategy=strategy, section_segment=section_segment, do_laplacian_augment=do_laplacian_augment)
-    else:
-        if do_train:
-            train(model, train_batches, dev_batches, out_dir, epochs, lr, dataset.class_weights,
-                accumulation_steps, strategy, use_warmup, warmup_steps, stop_on_roc, dump_test_preds, section_segment, do_laplacian_augment, 
-                do_contrastive_loss=do_contrastive_loss, alpha=alpha, temperature=temperature, max_negatives=max_negatives, memory_bank_load_amount=memory_bank_load_amount)
-        if do_test:
-            if checkpoint is not None: # 如果训练中断，加载一个中间段的checkpoint
-                if 'checkpoint' in checkpoint:
-                    full_checkpoint = torch.load(checkpoint)
-                    model.load_state_dict(full_checkpoint['model_state_dict'])
-                else: #如果直接load best_model
-                    model.load_state_dict(torch.load(checkpoint))
-                    print('Loaded checkpoint')
-            else: # 训练结束后，直接加载best model
-                model.load_state_dict(torch.load(os.path.join(out_dir, 'best_model.pt')))
-            
-            test(model, test_batches, dump_test_preds, out_dir, epoch="end", step="test",
-                class_weights=dataset.class_weights, strategy=strategy, section_segment=section_segment, do_laplacian_augment=do_laplacian_augment)
+        test(model, test_batches, dump_test_preds, out_dir, epoch="end", step="test",
+            class_weights=dataset.class_weights, strategy=strategy, section_segment=section_segment, orth_weight=orth_weight)
 
 if __name__ == '__main__':
 
@@ -1197,11 +1125,11 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, action='store', help='Path to checkpoint to load model weights from')
     parser.add_argument('--attention_window', type=int, action='store', default=512, help='Attention window size')
     parser.add_argument('--max_pos', type=int, action='store', default=4096, help='Maximum position embedding size')
-    parser.add_argument('--batch_size', type=int, action='store', default=4, help='Specify batch size')
+    parser.add_argument('--batch_size', type=int, action='store', default=12, help='Specify batch size')
     parser.add_argument('--lr', type=float, action='store', default=2e-5, help='Specify learning rate')
-    parser.add_argument('--epochs', type=int, action='store', default=20, help='Specify number of epochs')
-    parser.add_argument('--seed', type=int, action='store', default=42, help='Specify random seed')
-    parser.add_argument('--accumulation_steps', type=int, action='store', default=24, help='Specify number of steps for gradient accumulation')
+    parser.add_argument('--epochs', type=int, action='store', default=10, help='Specify number of epochs')
+    parser.add_argument('--seed', type=int, action='store', default=0, help='Specify random seed')
+    parser.add_argument('--accumulation_steps', type=int, action='store', default=48, help='Specify number of steps for gradient accumulation')
     parser.add_argument('--num_top_docs', type=float, action='store', default=1, help='Number of top ranked abstracts from PubMed to include')
     parser.add_argument('--strategy', type=str, action='store', default='average', help='Strategy to use to combine literature with EHR')
     parser.add_argument('--enc_strategy', type=str, action='store', default='bienc', help='Encoding strategy to use for notes and articles (bienc/crossenc)')
@@ -1220,43 +1148,69 @@ if __name__ == '__main__':
     parser.add_argument('--run_name', type=str, default="deault run name", action='store', help='name of the run')
     # Context specific augmentation 
     # parser.add_argument('--context_augment', action='store_true', default=False, help='Specify if use the ')
-    parser.add_argument('--num_head', type=int, action='store', help='number of head in multi-head attention block')
+    parser.add_argument('--num_heads', type=int, action='store', help='number of head in multi-head attention block')
     parser.add_argument('--section_segment', action='store_true', default=False, help='Decide if segment the EHR by section')
-    parser.add_argument('--do_contrastive', action='store_true', default=False, help='Decide if use the supervised contrastive learning')
-    parser.add_argument('--max_negatives', type=int, action='store', default=5, help='number of negatives for each anchor in contrastive learning')
-    parser.add_argument('--contrastive_epochs', type=int, action='store', default=20, help='number of epochs for contrastive learning')
-    parser.add_argument('--contrastive_batch_size', type=int, action='store', default=8, help='batch size for contrastive learning')
-    parser.add_argument('--alpha', type=float, action='store', default=0.2, help='weighte of contrastive loss')
-    parser.add_argument('--temperature', type=float, action='store', default=0.1, help='temperature of the contrastive loss')
-    parser.add_argument('--negative_pair_strategy', type=str, action='store', default='final', help='strategy to sample the negative pair')
-    parser.add_argument('--max_samples_per_outcome', type=int, action='store', default=800, help='number of sample for each outcome in preprocess')
-    parser.add_argument('--contrastive_lr', type=float, action='store', default=1e-5, help='learning rate for contrastive learning')
-    parser.add_argument('--section_selection', type=str, action='store', default='full', help='selected sections for contrastive learning')
-    parser.add_argument('--trained_contrastive_checkpoint_dir', type=str, action='store', default=None, help='saved contrastive trained model')
-    parser.add_argument('--do_laplacian_augment', action='store_true', default=False, help='if use laplacian to create the graph')
-    parser.add_argument('--la_alpha', type=float, action='store', default=0.3, help='laplacian smooth index')
-    parser.add_argument('--do_contrastive_loss', action='store_true', default=False, help='if add the contrastive loss to the CrossEntropy Loss')
-    parser.add_argument('--memory_bank_load_amount', type=int, action='store', default=8192, help='total number of features for memory bank to keep')
-    # parser.add_argument('--do_train', action='store_true', default=False, help='Specify if training should be performed')
+    parser.add_argument('--module_type', type=str, action='store', default='base', help='module type')
+    parser.add_argument('--delta', type=float, action='store', default=0.0, help='margin for orthogonal regulation')
+    parser.add_argument('--orth_weight', type=float, action='store', default=0.0, help='weight of the orthogonal loss')
+    parser.add_argument('--do_dimension_reduction', action='store_true', default=False, help='decide if we use the dimension reduction')
+    parser.add_argument('--reduced_dimension', type=int, action='store', default=256, help='reduced dimension')
+    parser.add_argument('--num_experts', type=int, action='store', default=0, help='number of experts for MOE module')
+    parser.add_argument('--num_layers', type=int, action='store', default=3, help='number of linear layers for position encoding')
+    # KNN moe hyperparameter
+    parser.add_argument('--top_k', type=int, action='store', default=0, help="Number of experts to be chosen")
+    parser.add_argument('--condition_dim', type=int, action='store', default=0, help='Dimension of the condition')
+    parser.add_argument('--enable_full', action='store_true', default=False)
+
     args = parser.parse_args()
     args_dict = vars(args)
 
     # do_long = args.longmodel_dir is not None
+    if args.longmodel_dir is not None:
+        args.module_type = 'base_long'
+        args.delta = None
+        args.orth_weight = None
+        args.reduced_dimension = None
+        args.lambda_residual = None
+        args.ssa_softmax_temp = None
+        
+    elif args.longmodel_dir is None and args.section_segment == False:
+        args.module_type = 'base'
+        args.delta = None
+        args.orth_weight = None
+        args.reduced_dimension = None
+    
+    if not args.do_dimension_reduction:
+        args.reduced_dimension = 768
+        
+    if not args.use_warmup:
+        args.warmup_steps = None
+
+        
     wandb.init(
-            project="Structured-Aware Clinical Note Processing",  # 项目名称
+            project=f"Structure_Aware_Adm_{args.outcome}",  # 项目名称
             entity="nkw3mr-university-of-virginia",  # 你的 WandB 用户名或团队名
             config={
-                "do_contrastive_loss": args.do_contrastive_loss,
-                "do_laplacian_augment": args.do_laplacian_augment,
-                "la_alpha": args.la_alpha,
-                "section_selection": args.section_selection,
+                "module_type": args.module_type,
                 "section_segment": args.section_segment,
                 "model": args.init_model,
                 "do_long": args.longmodel_dir is not None,
-                "contrastive_weight": args.alpha,
-                "temperature": args.temperature,
-                "max_negatives": args.max_negatives,
-                "memory_bank_load_amount": args.memory_bank_load_amount
+                "margin": args.delta,
+                "orth_weight": args.orth_weight,
+                'reduced_dimension': args.reduced_dimension,
+                "batch_size": args.batch_size,
+                "run_name": args.run_name,
+                "accumulation_steps": args.accumulation_steps,
+                "num_experts": args.num_experts,
+                'top_k':args.top_k,
+                'do_dimension_reduction':args.do_dimension_reduction,
+                'use_warmup': args.use_warmup,
+                'warmup_steps': args.warmup_steps,
+                'lr':args.lr,
+                'num_layers': args.num_layers,
+                'condition_dim': args.condition_dim,
+                'num_heads': args.num_heads,
+                'enable_full': args.enable_full
             }
         )  # 直接同步所有超参数
 
@@ -1268,6 +1222,6 @@ if __name__ == '__main__':
         print(f"{key}: {value}")
 
     args_dict = vars(args)
-    args_dict.pop("run_name")
+    # args_dict.pop("run_name")
     run(**args_dict)
     wandb.finish()
