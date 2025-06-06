@@ -1,0 +1,16 @@
+name: med-env
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - cudatoolkit=10.1.243=h6bb024c_0
+  - pillow=8.2.0=py38he98fc37_0
+  - pip=21.1.1=py38h06a4308_0
+  - python=3.8.10=hdb3f193_7
+  - setproctitle=1.2.2
+  - pip:
+     - ipykernel==5.5.5
+     - numpy==1.20.2
+     - nltk==3.6.2
+     - jupyter
+     - medspacy==0.2.0

@@ -1,0 +1,12 @@
+
+*
+!.gitignore
+output/
+outcome-prediction/umlsbert/
+outcome-prediction/output_dir/
+outcome-prediction/data/
+outcome-prediction/wandb/
+outcome-prediction/log/
+data/
+literature-retrieval/
+
