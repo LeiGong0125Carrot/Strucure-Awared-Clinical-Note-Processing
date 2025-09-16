@@ -1,4 +1,4 @@
-# BEEP
+# SAOC
 This repository contains code to run the Structural Aware Orthogonal Constraint (SAOC) Clinical outcome prediction system.
 
 ## Dataset 
