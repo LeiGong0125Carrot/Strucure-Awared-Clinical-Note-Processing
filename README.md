@@ -2,7 +2,7 @@
 This repository contains code to run the Structural Aware Orthogonal Constraint (SAOC) Clinical outcome prediction system.
 
 ## Dataset 
-Thanks for open-souring the project by beep https://github.com/allenai/BEEP/tree/main, we utilize the same strategy to filter the dataset from the MIMIC-III dataset ([download here](https://physionet.org/content/mimiciii-demo/1.4/)). You will also need to process and segment the dataset by the strategy in (https://github.com/LuChang-CS/semi-structured-icd-coding).
+Thanks for open-souring the project by beep https://github.com/allenai/BEEP/tree/main, we utilize the same strategy to filter the dataset from the MIMIC-III dataset ([download here](https://physionet.org/content/mimiciii-demo/1.4/)). You will also need to process and segment the dataset by the strategy in (https://github.com/LuChang-CS/semi-structured-icd-coding). If anyone wants to get the preprocessed segmented dataset, please contact me with access to the MIMIC dataset. I can directly send you the segmented dataset and raw dataset.
 
 ## Code Setup
 This code was developed in python 3.8 using the libraries listed in environment.yml. The easiest way to run this code is to set up a conda environment using the .yml file via the following command:
