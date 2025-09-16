@@ -34,7 +34,7 @@ Activate the conda environment using the command: ```conda activate beep-env```
 To replicate any of our training processes, use the following commands:
 
 
-## 🔴 BlueBert
+🔴 BlueBert
 
 ### Mortality Prediction (MP)
 ```bash
