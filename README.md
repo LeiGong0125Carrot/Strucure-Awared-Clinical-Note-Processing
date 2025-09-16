@@ -14,5 +14,6 @@ Activate the conda environment using the command: ```conda activate beep-env```
 
 ## Replicating Outcome Prediction Results
 To replicate any of our training processes, you only need to run using the following command:
-
-sbatch --export=ALL,init_model=$Model_Name,module_type=('Orth_inly'/'Co_orth'),use_section='true',batch_size=16,accumulation_steps=48,num_heads=0,orth_weight=0.4,delta=0.05 mp_wandb_adm.sbatch
+BlueBert:
+sbatch --export=ALL,init_model=$Model_Name,module_type=('Orth_inly'/'Co_orth'),use_section='true',batch_size=8,accumulation_steps= 8,num_heads=6,orth_weight=0.3,delta=0.1 mp_wandb_adm.sbatch
+sbatch --export=ALL,init_model=$Model_Name,module_type=('Orth_inly'/'Co_orth'),use_section='true',batch_size=16,accumulation_steps= 48,num_heads=2,orth_weight=0.4,delta=0.05 mp_wandb_adm.sbatch
