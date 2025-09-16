@@ -29,7 +29,8 @@ use_section='true',batch_size=16,accumulation_steps=48,num_heads=2,orth_weight=0
 pmv_wandb_adm.sbatch
 
 
-## BlueBert
+## COReBert
+```bash
 # Mortality Prediction (MP)
 sbatch --export=ALL,init_model=$Model_Name,module_type=('Orth_inly'/'Co_orth'), \
 use_section='true',batch_size=8,accumulation_steps=48,num_heads=6,orth_weight=0.5,delta=0.05 \
@@ -42,6 +43,7 @@ pmv_wandb_adm.sbatch
 
 
 ## UMLSBert
+```bash
 # Mortality Prediction (MP)
 sbatch --export=ALL,init_model=$Model_Name,module_type=('Orth_inly'/'Co_orth'), \
 use_section='true',batch_size=16,accumulation_steps=48,num_heads=2,orth_weight=0.4,delta=0.05 \
