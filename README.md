@@ -52,7 +52,7 @@ pmv_wandb_adm.sbatch
 
 ---
 
-## 🔴 COReBert (alternate setting)
+## 🔴 UMLSBert
 
 ### Mortality Prediction (MP)
 ```bash
